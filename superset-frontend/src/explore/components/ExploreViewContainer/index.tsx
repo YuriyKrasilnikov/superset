@@ -17,8 +17,15 @@
  * under the License.
  */
 /* eslint camelcase: 0 */
-import { memo, useCallback, useEffect, useMemo, useState } from 'react';
-import { bindActionCreators, Dispatch } from 'redux';
+import {
+  ComponentType,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react';
+import { bindActionCreators, Dispatch, ActionCreatorsMapObject } from 'redux';
 import { connect } from 'react-redux';
 import {
   useChangeEffect,
@@ -28,8 +35,12 @@ import {
   QueryFormData,
   JsonObject,
   MatrixifyFormData,
+  DatasourceType,
 } from '@superset-ui/core';
-import { ControlStateMapping } from '@superset-ui/chart-controls';
+import {
+  ControlStateMapping,
+  ControlPanelState,
+} from '@superset-ui/chart-controls';
 import { t, styled, css, useTheme } from '@apache-superset/core/ui';
 import { logging } from '@apache-superset/core';
 import { debounce, isEqual, isObjectLike, omit, pick } from 'lodash';
@@ -62,6 +73,7 @@ import { datasourcesActions } from 'src/explore/actions/datasourcesActions';
 import { mountExploreUrl } from 'src/explore/exploreUtils';
 import { getFormDataFromControls } from 'src/explore/controlUtils';
 import * as exploreActions from 'src/explore/actions/exploreActions';
+import { ExploreActions } from 'src/explore/actions/exploreActions';
 import * as saveModalActions from 'src/explore/actions/saveModalActions';
 import { useTabId } from 'src/hooks/useTabId';
 import withToasts from 'src/components/MessageToasts/withToasts';
@@ -69,6 +81,7 @@ import {
   ChartState,
   Datasource,
   ExplorePageInitialData,
+  ExplorePageState,
   SaveActionType,
 } from 'src/explore/types';
 import { Slice } from 'src/types/Chart';
@@ -311,7 +324,7 @@ interface OwnProps {
 interface StateProps {
   isDatasourceMetaLoading: boolean;
   datasource: Datasource;
-  datasource_type: string;
+  datasource_type: DatasourceType;
   datasourceId: number;
   dashboardId?: number;
   colorScheme?: string;
@@ -337,19 +350,29 @@ interface StateProps {
   ownState?: JsonObject;
   impressionId: string;
   user: User;
-  exploreState: ExploreRootState['explore'];
+  exploreState: ExplorePageState['explore'];
   reports: JsonObject;
   metadata?: ExplorePageInitialData['metadata'];
   saveAction?: SaveActionType | null;
   isSaveModalVisible: boolean;
 }
 
+// Combined actions type representing all action creators used in Explore
+type CombinedExploreActions = typeof exploreActions &
+  typeof datasourcesActions &
+  typeof saveModalActions &
+  typeof chartActions &
+  typeof logActions;
+
+// Bound action creators type (what mapDispatchToProps actually returns)
+type BoundActions<T extends ActionCreatorsMapObject> = {
+  [K in keyof T]: T[K] extends (...args: infer A) => infer R
+    ? (...args: A) => R extends (...args: unknown[]) => infer R2 ? R2 : R
+    : T[K];
+};
+
 interface DispatchProps {
-  actions: typeof exploreActions &
-    typeof datasourcesActions &
-    typeof saveModalActions &
-    typeof chartActions &
-    typeof logActions;
+  actions: BoundActions<CombinedExploreActions>;
 }
 
 type ExploreViewContainerProps = StateProps & DispatchProps & OwnProps;
@@ -731,7 +754,10 @@ function ExploreViewContainer(props: ExploreViewContainerProps) {
           .filter(control => control.validationErrors?.includes(message))
           .map(control =>
             typeof control.label === 'function'
-              ? control.label(props.exploreState as any, control)
+              ? control.label(
+                  props.exploreState as unknown as ControlPanelState,
+                  control,
+                )
               : control.label,
           );
         return [matchingLabels, message];
@@ -774,7 +800,10 @@ function ExploreViewContainer(props: ExploreViewContainerProps) {
           .filter(control => control.validationErrors?.includes(message))
           .map(control =>
             typeof control.label === 'function'
-              ? control.label(props.exploreState as any, control)
+              ? control.label(
+                  props.exploreState as unknown as ControlPanelState,
+                  control,
+                )
               : control.label,
           );
         return [matchingLabels, message];
@@ -845,6 +874,7 @@ function ExploreViewContainer(props: ExploreViewContainerProps) {
   return (
     <ExploreContainer>
       <ConnectedExploreChartHeader
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Combined actions type is compatible at runtime
         actions={props.actions as any}
         canOverwrite={props.can_overwrite}
         canDownload={props.can_download}
@@ -921,6 +951,7 @@ function ExploreViewContainer(props: ExploreViewContainerProps) {
               />
             </span>
           </div>
+          {/* eslint-disable @typescript-eslint/no-explicit-any -- DataSourcePanel uses narrower types that are compatible at runtime */}
           <DataSourcePanel
             formData={props.form_data}
             datasource={props.datasource as any}
@@ -928,6 +959,7 @@ function ExploreViewContainer(props: ExploreViewContainerProps) {
             actions={props.actions as any}
             width={width}
           />
+          {/* eslint-enable @typescript-eslint/no-explicit-any */}
         </Resizable>
         {isCollapsed ? (
           <div
@@ -965,12 +997,13 @@ function ExploreViewContainer(props: ExploreViewContainerProps) {
           className="col-sm-3 explore-column controls-column"
         >
           <ConnectedControlPanelsContainer
-            exploreState={props.exploreState as any}
+            exploreState={props.exploreState}
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Combined actions type is compatible at runtime
             actions={props.actions as any}
             form_data={props.form_data}
             controls={props.controls}
             chart={props.chart}
-            datasource_type={props.datasource_type as any}
+            datasource_type={props.datasource_type}
             isDatasourceMetaLoading={props.isDatasourceMetaLoading}
             onQuery={onQuery}
             onStop={onStop}
@@ -992,7 +1025,7 @@ function ExploreViewContainer(props: ExploreViewContainerProps) {
       {props.isSaveModalVisible && (
         <SaveModal
           addDangerToast={props.addDangerToast}
-          actions={props.actions as any}
+          actions={props.actions}
           form_data={props.form_data}
           sliceName={props.sliceName ?? undefined}
           dashboardId={props.dashboardId ?? null}
@@ -1148,7 +1181,9 @@ function mapStateToProps(state: ExploreRootState) {
     ownState: dataMask[slice_id]?.ownState,
     impressionId,
     user,
-    exploreState: explore,
+    // ExploreRootState['explore'] is compatible with ExplorePageState['explore']
+    // but has additional optional fields; casting is safe here
+    exploreState: explore as unknown as ExplorePageState['explore'],
     reports,
     metadata,
     saveAction: explore.saveAction,
@@ -1156,8 +1191,8 @@ function mapStateToProps(state: ExploreRootState) {
   };
 }
 
-function mapDispatchToProps(dispatch: Dispatch) {
-  const actions = {
+function mapDispatchToProps(dispatch: Dispatch): DispatchProps {
+  const actions: CombinedExploreActions = {
     ...exploreActions,
     ...datasourcesActions,
     ...saveModalActions,
@@ -1165,11 +1200,16 @@ function mapDispatchToProps(dispatch: Dispatch) {
     ...logActions,
   };
   return {
-    actions: bindActionCreators(actions as any, dispatch),
+    actions: bindActionCreators(
+      actions as ActionCreatorsMapObject,
+      dispatch,
+    ) as BoundActions<CombinedExploreActions>,
   };
 }
 
+// withToasts HOC expects ComponentType<any>, requiring type assertion
+// The connected component properly handles StateProps & DispatchProps & OwnProps
 export default connect(
   mapStateToProps,
   mapDispatchToProps,
-)(withToasts(memo(ExploreViewContainer)) as any);
+)(withToasts(memo(ExploreViewContainer)) as ComponentType<OwnProps>);
