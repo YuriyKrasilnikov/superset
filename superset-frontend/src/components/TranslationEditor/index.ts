@@ -16,7 +16,12 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-export { default as TranslationButton } from './TranslationButton';
-export { default as TranslationEditorModal } from './TranslationEditorModal';
-export { default as TranslationField } from './TranslationField';
-export type { TranslatableField } from './TranslationEditorModal';
+export { default as LocaleSwitcher } from './LocaleSwitcher';
+export type { LocaleSwitcherProps } from './LocaleSwitcher';
+export { default as TranslationTextAreaWrapper } from './TranslationTextAreaWrapper';
+export {
+  DEFAULT_LOCALE_KEY,
+  deepCopyTranslations,
+  stripEmptyValues,
+  countFieldTranslations,
+} from './utils';

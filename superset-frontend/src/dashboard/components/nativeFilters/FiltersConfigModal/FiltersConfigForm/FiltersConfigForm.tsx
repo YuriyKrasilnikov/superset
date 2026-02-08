@@ -90,9 +90,9 @@ import {
 } from 'src/dashboard/components/nativeFilters/utils';
 import { DatasetSelectLabel } from 'src/features/datasets/DatasetSelectLabel';
 import {
-  TranslationButton,
-  TranslationEditorModal,
-  type TranslatableField,
+  LocaleSwitcher,
+  DEFAULT_LOCALE_KEY,
+  stripEmptyValues,
 } from 'src/components/TranslationEditor';
 import type { Translations, LocaleInfo } from 'src/types/Localization';
 import {
@@ -110,8 +110,10 @@ import RemovedFilter from './RemovedFilter';
 import { useBackendFormUpdate, useDefaultValue } from './state';
 import {
   hasTemporalColumns,
+  isValidFilterValue,
   mostUsedDataset,
   setNativeFilterFieldValues,
+  shouldShowTimeRangePicker,
   useForceUpdate,
 } from './utils';
 import {
@@ -314,8 +316,13 @@ const FiltersConfigForm = (
     any
   > | null>(null);
   const forceUpdate = useForceUpdate(isActive);
-  const [showTranslationModal, setShowTranslationModal] = useState(false);
-  const [availableLocales, setAvailableLocales] = useState<LocaleInfo[]>([]);
+  const [nameActiveLocale, setNameActiveLocale] = useState(DEFAULT_LOCALE_KEY);
+  const [allLocales, setAllLocales] = useState<LocaleInfo[]>([]);
+  const [defaultLocale, setDefaultLocale] = useState('');
+  const userLocale: string = useSelector(
+    (state: RootState & { common: { locale: string } }) =>
+      state.common.locale,
+  );
   const [datasetDetails, setDatasetDetails] = useState<Record<string, any>>();
   const defaultFormFilter = useMemo(() => ({}), []);
   const filters = form.getFieldValue('filters');
@@ -333,14 +340,14 @@ const FiltersConfigForm = (
 
   const nativeFilterAndCustomizationItems = getChartMetadataRegistry().items;
   const nativeFilterVizTypes = Object.entries(nativeFilterAndCustomizationItems)
-    // @ts-ignore
+    // @ts-expect-error
     .filter(([, { value }]) => value.behaviors?.includes(Behavior.NativeFilter))
     .map(([key]) => key as keyof typeof FILTER_SUPPORTED_TYPES);
 
   const chartCustomizationVizTypes = Object.entries(
     nativeFilterAndCustomizationItems,
   )
-    // @ts-ignore
+    // @ts-expect-error
     .filter(([, { value }]) =>
       value.behaviors?.includes(Behavior.ChartCustomization),
     )
@@ -364,8 +371,7 @@ const FiltersConfigForm = (
     const currentDataset = Object.values(loadedDatasets).find(
       dataset => dataset.id === formFilter?.dataset?.value,
     );
-
-    return currentDataset ? hasTemporalColumns(currentDataset) : true;
+    return shouldShowTimeRangePicker(currentDataset);
   }, [formFilter?.dataset?.value, loadedDatasets]);
 
   const itemTypeField =
@@ -375,7 +381,7 @@ const FiltersConfigForm = (
       : filterToEdit?.filterType || 'filter_select');
 
   const hasDataset =
-    // @ts-ignore
+    // @ts-expect-error
     !!nativeFilterAndCustomizationItems[itemTypeField]?.value?.datasourceCount;
 
   const getDatasetId = () => {
@@ -432,7 +438,7 @@ const FiltersConfigForm = (
 
   const nativeFilterItem =
     nativeFilterAndCustomizationItems[itemTypeField] ?? {};
-  // @ts-ignore
+  // @ts-expect-error
   const enableNoResults = !!nativeFilterItem.value?.enableNoResults;
 
   const hasMetrics = hasColumn && !!metrics.length;
@@ -508,10 +514,10 @@ const FiltersConfigForm = (
 
             if (response.status === 200) {
               setNativeFilterFieldValuesWrapper({
-                defaultValueQueriesData: [result],
+                defaultValueQueriesData: [result as ChartDataResponseResult],
               });
             } else if (response.status === 202) {
-              waitForAsyncData(result)
+              waitForAsyncData(result as Parameters<typeof waitForAsyncData>[0])
                 .then((asyncResult: ChartDataResponseResult[]) => {
                   setNativeFilterFieldValuesWrapper({
                     defaultValueQueriesData: asyncResult,
@@ -599,44 +605,73 @@ const FiltersConfigForm = (
       }).then(
         response => {
           const { locales, default_locale } = response.json.result;
-          setAvailableLocales(
-            locales.filter((loc: LocaleInfo) => loc.code !== default_locale),
-          );
+          setAllLocales(locales);
+          setDefaultLocale(default_locale);
         },
         err => getClientErrorObject(err).then(setError),
       );
     }
   }, [localizationEnabled]);
 
-  const translationCount = useMemo(() => {
-    const locales = new Set<string>();
-    Object.values(currentTranslations).forEach(fieldTrans => {
-      Object.keys(fieldTrans).forEach(locale => locales.add(locale));
-    });
-    return locales.size;
-  }, [currentTranslations]);
+  // Initialize nameActiveLocale based on existing translations
+  useEffect(() => {
+    if (localizationEnabled && currentTranslations.name?.[userLocale]) {
+      setNameActiveLocale(userLocale);
+    } else {
+      setNameActiveLocale(DEFAULT_LOCALE_KEY);
+    }
+  }, [localizationEnabled, filterId]);
 
-  const translatableFields: TranslatableField[] = useMemo(
-    () => [
-      {
-        name: 'name',
-        label: t('Filter name'),
-        value: formFilter?.name ?? filterToEdit?.name ?? '',
-      },
-    ],
+  const handleNameTranslationChange = useCallback(
+    (value: string) => {
+      const updated: Translations = {
+        ...currentTranslations,
+        name: { ...currentTranslations.name, [nameActiveLocale]: value },
+      };
+      setNativeFilterFieldValues(form, filterId, {
+        translations: stripEmptyValues(updated),
+      });
+      formChanged();
+    },
+    [currentTranslations, nameActiveLocale, form, filterId, formChanged],
+  );
+
+  /** Validate default name is non-empty before switching to translation. */
+  const handleNameLocaleChange = useCallback(
+    (locale: string) => {
+      if (locale !== DEFAULT_LOCALE_KEY) {
+        const nameValue = formFilter?.name ?? filterToEdit?.name ?? '';
+        if (!nameValue.trim()) {
+          addDangerToast(
+            t('Default text is required before adding translations'),
+          );
+          return;
+        }
+      }
+      setNameActiveLocale(locale);
+    },
     [formFilter?.name, filterToEdit?.name],
   );
 
-  const handleSaveTranslations = useCallback(
-    (updatedTranslations: Translations) => {
-      setNativeFilterFieldValues(form, filterId, {
-        translations: updatedTranslations,
-      });
-      formChanged();
-      setShowTranslationModal(false);
-    },
-    [form, filterId, formChanged],
-  );
+  const isEditingFilterTranslation =
+    localizationEnabled &&
+    !isChartCustomization &&
+    nameActiveLocale !== DEFAULT_LOCALE_KEY;
+
+  const nameLocaleSwitcher =
+    localizationEnabled && !isChartCustomization ? (
+      <LocaleSwitcher
+        fieldName="name"
+        defaultValue={formFilter?.name ?? filterToEdit?.name ?? ''}
+        translations={currentTranslations}
+        allLocales={allLocales}
+        defaultLocale={defaultLocale}
+        userLocale={userLocale}
+        activeLocale={nameActiveLocale}
+        onLocaleChange={handleNameLocaleChange}
+        fieldLabel={t('Filter name')}
+      />
+    ) : undefined;
 
   const hasPreFilter =
     !!formFilter?.adhoc_filters ||
@@ -888,12 +923,6 @@ const FiltersConfigForm = (
       />
     </StyledRowFormItem>
   );
-  const isValidFilterValue = (value: unknown, isRangeFilter: boolean) => {
-    if (isRangeFilter) {
-      return Array.isArray(value) && (value[0] !== null || value[1] !== null);
-    }
-    return !!value;
-  };
   return (
   <>
     <Tabs
@@ -926,25 +955,42 @@ const FiltersConfigForm = (
                     rules={[
                       { required: !isRemoved, message: t('Name is required') },
                     ]}
+                    hidden={isEditingFilterTranslation}
                   >
                     <Input
                       {...getFiltersConfigModalTestId('name-input')}
                       onChange={debouncedFormChanged}
+                      suffix={nameLocaleSwitcher}
                     />
                   </StyledFormItem>
+                  {isEditingFilterTranslation && (
+                    <StyledFormItem
+                      expanded={expanded}
+                      label={<StyledLabel>{t('Filter name')}</StyledLabel>}
+                    >
+                      <Input
+                        {...getFiltersConfigModalTestId('name-input')}
+                        value={
+                          currentTranslations.name?.[nameActiveLocale] ?? ''
+                        }
+                        onChange={e =>
+                          handleNameTranslationChange(e.target.value)
+                        }
+                        suffix={nameLocaleSwitcher}
+                        placeholder={t(
+                          'Translation for %s',
+                          nameActiveLocale.toUpperCase(),
+                        )}
+                      />
+                    </StyledFormItem>
+                  )}
                   {localizationEnabled && !isChartCustomization && (
-                    <>
-                      <FormItem
-                        name={['filters', filterId, 'translations']}
-                        initialValue={filterToEdit?.translations}
-                        hidden
-                        noStyle
-                      />
-                      <TranslationButton
-                        translationCount={translationCount}
-                        onClick={() => setShowTranslationModal(true)}
-                      />
-                    </>
+                    <FormItem
+                      name={['filters', filterId, 'translations']}
+                      initialValue={filterToEdit?.translations}
+                      hidden
+                      noStyle
+                    />
                   )}
                   {isChartCustomization ? (
                     <StyledFormItem
@@ -965,7 +1011,7 @@ const FiltersConfigForm = (
                         ariaLabel={t('Customization type')}
                         options={chartCustomizationVizTypes.map(pluginKey => {
                           const name =
-                            // @ts-ignore
+                            // @ts-expect-error
                             nativeFilterAndCustomizationItems[pluginKey]?.value
                               ?.name;
                           return {
@@ -1003,7 +1049,7 @@ const FiltersConfigForm = (
                         ariaLabel={t('Filter type')}
                         options={nativeFilterVizTypes.map(filterType => {
                           const name =
-                            // @ts-ignore
+                            // @ts-expect-error
                             nativeFilterAndCustomizationItems[filterType]?.value
                               .name;
                           const mappedName = name
@@ -1818,16 +1864,6 @@ const FiltersConfigForm = (
         },
       ]}
     />
-    {localizationEnabled && !isChartCustomization && (
-      <TranslationEditorModal
-        show={showTranslationModal}
-        fields={translatableFields}
-        translations={currentTranslations}
-        availableLocales={availableLocales}
-        onSave={handleSaveTranslations}
-        onClose={() => setShowTranslationModal(false)}
-      />
-    )}
   </>
   );
 };
