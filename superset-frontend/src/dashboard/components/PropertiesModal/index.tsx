@@ -27,7 +27,7 @@ import {
 import { useJsonValidation } from '@superset-ui/core/components/AsyncAceEditor';
 import { type TagType } from 'src/components';
 import rison from 'rison';
-import { t } from '@apache-superset/core';
+import { logging, t } from '@apache-superset/core';
 import {
   ensureIsArray,
   isFeatureEnabled,
@@ -115,6 +115,7 @@ const PropertiesModal = ({
 }: PropertiesModalProps) => {
   const dispatch = useDispatch();
   const [form] = Form.useForm();
+  const currentTitle: string = Form.useWatch('title', form) ?? '';
 
   const [isLoading, setIsLoading] = useState(true);
   const [isApplying, setIsApplying] = useState(false);
@@ -490,7 +491,7 @@ const PropertiesModal = ({
             setAllLocales(locales);
             setDefaultLocale(default_locale);
           },
-          handleErrorResponse,
+          err => logging.error('Failed to fetch available locales', err),
         );
       }
     }
@@ -764,7 +765,7 @@ const PropertiesModal = ({
                     ) ? (
                       <LocaleSwitcher
                         fieldName="dashboard_title"
-                        defaultValue={dashboardInfo?.title ?? ''}
+                        defaultValue={currentTitle}
                         translations={translations}
                         allLocales={allLocales}
                         defaultLocale={defaultLocale}

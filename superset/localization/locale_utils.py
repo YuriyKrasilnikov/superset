@@ -103,6 +103,32 @@ def _parse_quality(quality_part: str) -> float:
         return 0.0
 
 
+def get_translation(translations: dict[str, str], locale: str) -> str | None:
+    """
+    Get translation for locale with base language fallback.
+
+    Tries exact locale match first, then base language
+    (splitting on hyphen or underscore: de-DE -> de, pt_BR -> pt).
+
+    Args:
+        translations: Dict mapping locale codes to translated values.
+        locale: Target locale code.
+
+    Returns:
+        Translated value if found, None otherwise.
+    """
+    if locale in translations:
+        return translations[locale]
+
+    for sep in ("-", "_"):
+        if sep in locale:
+            base_locale = locale.split(sep)[0]
+            if base_locale in translations:
+                return translations[base_locale]
+
+    return None
+
+
 def get_user_locale(locale: str | None = None, validate: bool = False) -> str:
     """
     Get user's locale for content localization.
@@ -127,8 +153,8 @@ def get_user_locale(locale: str | None = None, validate: bool = False) -> str:
     if locale:
         resolved_locale = locale
 
-    # Priority 2: Session locale
-    if not resolved_locale:
+    # Priority 2: Session locale (only if in request context)
+    if not resolved_locale and has_request_context():
         resolved_locale = session.get("locale")
 
     # Priority 3: Accept-Language header (only if in request context)

@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import type { MenuProps } from 'antd';
 import { t } from '@apache-superset/core';
 import { css, useTheme } from '@apache-superset/core/ui';
@@ -90,7 +90,6 @@ export default function LocaleSwitcher({
 
   const isDefault = activeLocale === DEFAULT_LOCALE_KEY;
   const activeLocaleInfo = isDefault ? undefined : localeMap.get(activeLocale);
-  const triggerLabel = isDefault ? t('DEFAULT') : activeLocale.toUpperCase();
   const triggerFlag = activeLocaleInfo?.flag;
 
   const menuItems: MenuProps['items'] = useMemo(() => {
@@ -148,8 +147,11 @@ export default function LocaleSwitcher({
     activeLocale,
   ]);
 
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+
   const handleMenuClick: MenuProps['onClick'] = ({ key }) => {
     onLocaleChange(key);
+    setDropdownOpen(false);
   };
 
   const suffixColor = isWarning ? theme.colorWarning : theme.colorText;
@@ -158,6 +160,8 @@ export default function LocaleSwitcher({
     <Dropdown
       menu={{ items: menuItems, onClick: handleMenuClick }}
       trigger={['click']}
+      open={dropdownOpen}
+      onOpenChange={setDropdownOpen}
       getPopupContainer={() => document.body}
     >
       <span
@@ -174,6 +178,7 @@ export default function LocaleSwitcher({
           if (e.key === 'Enter' || e.key === ' ') {
             e.stopPropagation();
             e.preventDefault();
+            setDropdownOpen(prev => !prev);
           }
         }}
         css={css`
@@ -203,14 +208,6 @@ export default function LocaleSwitcher({
             `}
           />
         )}
-        <span
-          css={css`
-            font-size: 11px;
-            font-weight: 500;
-          `}
-        >
-          {triggerLabel}
-        </span>
         <Badge count={translationCount} size="small" showZero={false} />
         <Icons.CaretDownOutlined
           iconSize="s"
