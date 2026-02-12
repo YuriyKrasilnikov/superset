@@ -16,14 +16,13 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-export { default as LocaleSwitcher } from './LocaleSwitcher';
-export type { LocaleSwitcherProps } from './LocaleSwitcher';
-export { default as TranslationTextAreaWrapper } from './TranslationTextAreaWrapper';
+
+export { LocaleController } from './LocaleController';
+export type { LocaleControllerOptions } from './LocaleController';
+
 export {
-  DEFAULT_LOCALE_KEY,
-  stripEmptyValues,
-  countFieldTranslations,
-  getLocalizedValue,
-  getLocalizedMetricLabel,
-  buildLocalizedMetricLabelMap,
-} from './utils';
+  LocaleProvider,
+  useLocaleContext,
+  useCurrentLocale,
+} from './LocaleProvider';
+export type { LocaleContextType } from './LocaleProvider';
