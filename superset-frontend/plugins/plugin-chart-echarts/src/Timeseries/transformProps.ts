@@ -24,6 +24,8 @@ import {
   AxisType,
   buildCustomFormatters,
   buildLocalizedMetricLabelMap,
+  getLocalizedAnnotationName,
+  getLocalizedFormDataValue,
   CategoricalColorNamespace,
   CurrencyFormatter,
   ensureIsArray,
@@ -40,6 +42,7 @@ import {
   isTimeseriesAnnotationLayer,
   resolveAutoCurrency,
   TimeseriesChartDataResponseResult,
+  TimeseriesDataRecord,
   NumberFormats,
 } from '@superset-ui/core';
 import { GenericDataType } from '@apache-superset/core/api/core';
@@ -216,6 +219,13 @@ export default function transformProps(
     zoomable,
     stackDimension,
   }: EchartsTimeseriesFormData = { ...DEFAULT_FORM_DATA, ...formData };
+
+  const localizedXAxisTitle =
+    getLocalizedFormDataValue(formData.translations, 'x_axis_title', locale) ??
+    xAxisTitle;
+  const localizedYAxisTitle =
+    getLocalizedFormDataValue(formData.translations, 'y_axis_title', locale) ??
+    yAxisTitle;
 
   const refs: Refs = {};
   const groupBy = ensureIsArray(groupby);
@@ -464,19 +474,28 @@ export default function transformProps(
     {},
   );
 
+  // Pre-resolve localized annotation names for display
+  const localizedAnnotationNames = new Set(
+    annotationLayers
+      .filter((layer: AnnotationLayer) => layer.show)
+      .map(layer => getLocalizedAnnotationName(layer, locale)),
+  );
+
   annotationLayers
     .filter((layer: AnnotationLayer) => layer.show)
     .forEach((layer: AnnotationLayer) => {
+      const localizedName = getLocalizedAnnotationName(layer, locale);
       if (isFormulaAnnotationLayer(layer))
         series.push(
           transformFormulaAnnotation(
             layer,
-            data,
+            rebasedData as TimeseriesDataRecord[],
             xAxisLabel,
             xAxisType,
             colorScale,
             sliceId,
             orientation,
+            localizedName,
           ),
         );
       else if (isIntervalAnnotationLayer(layer)) {
@@ -489,6 +508,7 @@ export default function transformProps(
             theme,
             sliceId,
             orientation,
+            localizedName,
           ),
         );
       } else if (isEventAnnotationLayer(layer)) {
@@ -501,6 +521,7 @@ export default function transformProps(
             theme,
             sliceId,
             orientation,
+            localizedName,
           ),
         );
       } else if (isTimeseriesAnnotationLayer(layer)) {
@@ -513,6 +534,7 @@ export default function transformProps(
             colorScale,
             sliceId,
             orientation,
+            localizedName,
           ),
         );
       }
@@ -583,9 +605,9 @@ export default function transformProps(
   } = hooks;
 
   const addYAxisLabelOffset =
-    !!yAxisTitle && convertInteger(yAxisTitleMargin) !== 0;
+    !!localizedYAxisTitle && convertInteger(yAxisTitleMargin) !== 0;
   const addXAxisLabelOffset =
-    !!xAxisTitle && convertInteger(xAxisTitleMargin) !== 0;
+    !!localizedXAxisTitle && convertInteger(xAxisTitleMargin) !== 0;
   const padding = getPadding(
     showLegend,
     legendOrientation,
@@ -606,11 +628,11 @@ export default function transformProps(
         ForecastSeriesEnum.Observation,
     )
     .map(entry => entry.name || '')
-    .concat(extractAnnotationLabels(annotationLayers));
+    .concat(extractAnnotationLabels(annotationLayers, locale));
 
   let xAxis: any = {
     type: xAxisType,
-    name: xAxisTitle,
+    name: localizedXAxisTitle,
     nameGap: convertInteger(xAxisTitleMargin),
     nameLocation: 'middle',
     axisLabel: {
@@ -662,7 +684,7 @@ export default function transformProps(
       ),
     },
     scale: truncateYAxis,
-    name: yAxisTitle,
+    name: localizedYAxisTitle,
     nameGap: convertInteger(yAxisTitleMargin),
     nameLocation: yAxisTitlePosition === 'Left' ? 'middle' : 'end',
   };
@@ -707,10 +729,7 @@ export default function transformProps(
         );
         const filteredForecastValue = forecastValue.filter(
           (item: CallbackDataParams) =>
-            !annotationLayers.some(
-              (annotation: AnnotationLayer) =>
-                item.seriesName === annotation.name,
-            ),
+            !localizedAnnotationNames.has(item.seriesName as string),
         );
         const forecastValues: Record<string, ForecastValue> =
           extractForecastValuesFromTooltipParams(forecastValue, isHorizontal);
@@ -755,9 +774,7 @@ export default function transformProps(
               formatter,
             });
 
-            const annotationRow = annotationLayers.some(
-              item => item.name === key,
-            );
+            const annotationRow = localizedAnnotationNames.has(key);
 
             if (
               showPercentage &&
@@ -780,7 +797,7 @@ export default function transformProps(
           }
         }
         if (allowTotal && showTooltipTotal) {
-          const totalRow = ['Total', formatter.format(total)];
+          const totalRow = [t('Total'), formatter.format(total)];
           if (showPercentage) {
             totalRow.push(percentFormatter.format(1));
           }

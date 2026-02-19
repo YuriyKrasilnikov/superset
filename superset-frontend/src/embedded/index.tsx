@@ -20,7 +20,8 @@ import 'src/public-path';
 
 // IMPORTANT: initEmbedded MUST be imported before setupPlugins!
 // It initializes feature flags which some plugins check at module load time.
-import { bootstrapData } from './initEmbedded';
+// It also reads ?locale= URL param for initial locale.
+import { bootstrapData, locale } from './initEmbedded';
 
 import { lazy, Suspense } from 'react';
 import ReactDOM from 'react-dom';
@@ -50,12 +51,12 @@ import { getDataMaskChangeTrigger } from './utils';
 import { LocaleController } from 'src/locale';
 
 // Create locale controller for embedded context
-// Initial locale comes from bootstrap data (exported from initEmbedded)
+// Initial locale comes from URL param (?locale=) or bootstrap data
 const localeController = new LocaleController({
-  initialLocale: bootstrapData.common?.locale || 'en',
-  // Skip initial fetch because preamble may have already loaded it,
-  // or we'll load it when setLocale is called
-  skipInitialFetch: true,
+  initialLocale: locale,
+  // Skip initial fetch only if locale is 'en' (no language pack needed)
+  // Otherwise fetch the language pack for proper translations
+  skipInitialFetch: locale === 'en',
 });
 
 /**

@@ -24,11 +24,23 @@
  * at module load time when defining exports like jsDataMutator, jsTooltip, etc.
  * Since ES modules are executed when imported, we need to initialize feature
  * flags before those imports happen.
+ *
+ * This module also reads the ?locale= URL parameter for embedded dashboards,
+ * allowing the SDK to specify the initial locale without flash.
  */
 import { initFeatureFlags } from '@superset-ui/core';
 import getBootstrapData from 'src/utils/getBootstrapData';
+import { getUrlParam } from 'src/utils/urlUtils';
+import { URL_PARAMS } from 'src/constants';
 
 const bootstrapData = getBootstrapData();
+
+// Initialize feature flags first - required before plugin imports
 initFeatureFlags(bootstrapData.common.feature_flags);
 
-export { bootstrapData };
+// Determine locale: URL param takes priority over bootstrap data
+// This allows SDK to pass ?locale=de for immediate correct rendering
+const urlLocale = getUrlParam(URL_PARAMS.locale);
+const locale = urlLocale || bootstrapData.common?.locale || 'en';
+
+export { bootstrapData, locale };
