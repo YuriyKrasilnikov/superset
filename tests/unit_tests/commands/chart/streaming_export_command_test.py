@@ -16,13 +16,17 @@
 # under the License.
 """Unit tests for Chart Streaming CSV Export Command."""
 
+from datetime import date
+
 import pytest
+from flask import current_app
 from pytest_mock import MockerFixture
 
 from superset.commands.chart.data.streaming_export_command import (
     StreamingCSVExportCommand,
+    StreamingExportIneligibility,
 )
-from superset.exceptions import QueryObjectValidationError
+from superset.common.chart_data import ChartDataResultFormat, ChartDataResultType
 
 
 def _setup_chart_mocks(
@@ -37,14 +41,35 @@ def _setup_chart_mocks(
     mock_db.session.return_value.__enter__.return_value = mock_session
 
     query_context = mocker.MagicMock()
+    query_context.result_format = ChartDataResultFormat.CSV
+    query_context.result_type = ChartDataResultType.FULL
     datasource = mocker.MagicMock()
-    datasource.get_query_str_extended.return_value.sql = sql
+    query_str = mocker.MagicMock()
+    query_str.sql = sql
+    query_str.labels_expected = []
+    datasource.get_query_str_extended.return_value = query_str
     datasource.database = mocker.MagicMock()
+    datasource.database.db_engine_spec.supports_direct_csv_streaming = True
+    datasource.database.db_engine_spec.engine = "postgresql"
+    datasource.database.mutate_sql_based_on_config.side_effect = (
+        lambda query_sql, is_split: query_sql
+    )
     datasource.catalog = catalog
     datasource.schema = schema
     query_context.datasource = datasource
-    query_context.queries = [mocker.MagicMock()]
+    query = mocker.MagicMock()
+    query.post_processing = []
+    query.time_offsets = []
+    query.annotation_layers = []
+    query.is_rowcount = False
+    query.is_timeseries = False
+    query.metrics = []
+    query.contribution_totals_query_index = None
+    query_context.queries = [query]
+    datasource._collect_dttm_labels.return_value = ()
     mock_session.merge.return_value = datasource.database
+    engine = datasource.database.get_sqla_engine.return_value.__enter__.return_value
+    engine.dialect.supports_server_side_cursors = True
 
     return mock_db, query_context, datasource
 
@@ -63,7 +88,11 @@ def test_streaming_export_compiles_executable_query(mocker: MockerFixture) -> No
     sql, _, _, _ = StreamingCSVExportCommand(query_context)._get_sql_and_database()
 
     assert sql == "SELECT * FROM executable_query"
-    datasource.get_query_str_extended.assert_called_once_with({"series_limit": 10})
+    datasource.get_query_str_extended.assert_called_once_with(
+        {"series_limit": 10},
+        mutate=True,
+        defer_source_queries=False,
+    )
     datasource.get_query_str.assert_not_called()
 
 
@@ -74,10 +103,7 @@ def test_streaming_export_rejects_non_sql_datasource(
     _, query_context, datasource = _setup_chart_mocks(mocker)
     datasource.get_query_str_extended = None
 
-    with pytest.raises(
-        QueryObjectValidationError,
-        match="Streaming CSV export requires a SQL datasource",
-    ):
+    with pytest.raises(ValueError, match="UNSUPPORTED_DATASOURCE"):
         StreamingCSVExportCommand(query_context)._get_sql_and_database()
 
 
@@ -119,6 +145,150 @@ def test_validate_raises_exception_on_access_denied(mocker: MockerFixture) -> No
 
     with pytest.raises(Exception, match="Access denied"):
         command.validate()
+
+
+def test_prepare_compiles_final_sql_without_deferred_sources(
+    mocker: MockerFixture,
+) -> None:
+    """Planning compiles the executable main query but does not execute it."""
+    _, query_context, datasource = _setup_chart_mocks(
+        mocker, sql="SELECT category, SUM(value) FROM t GROUP BY category"
+    )
+    query = query_context.queries[0]
+
+    preparation = StreamingCSVExportCommand(query_context).prepare()
+
+    assert preparation.eligible
+    assert preparation.query is not None
+    assert preparation.query.sql == (
+        "SELECT category, SUM(value) FROM t GROUP BY category"
+    )
+    datasource.get_query_str_extended.assert_called_once_with(
+        query.to_dict.return_value,
+        mutate=True,
+        defer_source_queries=False,
+    )
+    datasource._raise_for_disallowed_sql.assert_called_once_with(preparation.query.sql)
+    query_context.raise_for_access.assert_called_once_with()
+    query.validate.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("post_processing", [{"operation": "pivot"}]),
+        ("time_offsets", ["1 year ago"]),
+        ("annotation_layers", [{"annotationType": "FORMULA"}]),
+        ("is_rowcount", True),
+    ],
+)
+def test_prepare_rejects_python_result_transforms(
+    mocker: MockerFixture,
+    attribute: str,
+    value: object,
+) -> None:
+    _, query_context, datasource = _setup_chart_mocks(mocker)
+    setattr(query_context.queries[0], attribute, value)
+
+    preparation = StreamingCSVExportCommand(query_context).prepare()
+
+    assert not preparation.eligible
+    assert preparation.ineligibility == StreamingExportIneligibility.RESULT_TRANSFORM
+    datasource.get_query_str_extended.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("metrics", ["count"]),
+        ("is_timeseries", True),
+    ],
+)
+def test_prepare_rejects_dataframe_value_normalization(
+    mocker: MockerFixture,
+    attribute: str,
+    value: object,
+) -> None:
+    _, query_context, datasource = _setup_chart_mocks(mocker)
+    setattr(query_context.queries[0], attribute, value)
+
+    preparation = StreamingCSVExportCommand(query_context).prepare()
+
+    assert preparation.ineligibility == StreamingExportIneligibility.VALUE_NORMALIZATION
+    datasource.get_query_str_extended.assert_not_called()
+
+
+def test_prepare_rejects_datetime_normalization(mocker: MockerFixture) -> None:
+    _, query_context, datasource = _setup_chart_mocks(mocker)
+    datasource._collect_dttm_labels.return_value = (("event_time", "epoch_ms"),)
+
+    preparation = StreamingCSVExportCommand(query_context).prepare()
+
+    assert preparation.ineligibility == StreamingExportIneligibility.VALUE_NORMALIZATION
+    datasource.get_query_str_extended.assert_not_called()
+
+
+def test_prepare_rejects_multiple_queries(mocker: MockerFixture) -> None:
+    _, query_context, datasource = _setup_chart_mocks(mocker)
+    query_context.queries.append(mocker.MagicMock())
+
+    preparation = StreamingCSVExportCommand(query_context).prepare()
+
+    assert preparation.ineligibility == StreamingExportIneligibility.MULTIPLE_QUERIES
+    datasource.get_query_str_extended.assert_not_called()
+
+
+def test_prepare_rejects_dialect_without_server_side_cursor(
+    mocker: MockerFixture,
+) -> None:
+    _, query_context, datasource = _setup_chart_mocks(mocker)
+    engine = datasource.database.get_sqla_engine.return_value.__enter__.return_value
+    engine.dialect.supports_server_side_cursors = False
+
+    preparation = StreamingCSVExportCommand(query_context).prepare()
+
+    assert preparation.ineligibility == StreamingExportIneligibility.UNSUPPORTED_DIALECT
+    datasource.get_query_str_extended.assert_not_called()
+
+
+def test_prepare_rejects_engine_without_normalization_contract(
+    mocker: MockerFixture,
+) -> None:
+    _, query_context, datasource = _setup_chart_mocks(mocker)
+    datasource.database.db_engine_spec.supports_direct_csv_streaming = False
+
+    preparation = StreamingCSVExportCommand(query_context).prepare()
+
+    assert preparation.ineligibility == StreamingExportIneligibility.UNSUPPORTED_ENGINE
+    datasource.database.get_sqla_engine.assert_not_called()
+
+
+def test_prepare_rejects_multi_statement_sql_after_mutation(
+    mocker: MockerFixture,
+) -> None:
+    _, query_context, datasource = _setup_chart_mocks(mocker)
+    datasource.database.mutate_sql_based_on_config.return_value = "SELECT 1; SELECT 2"
+    datasource.database.mutate_sql_based_on_config.side_effect = None
+
+    preparation = StreamingCSVExportCommand(query_context).prepare()
+
+    assert preparation.ineligibility == StreamingExportIneligibility.MULTI_STATEMENT_SQL
+    datasource._raise_for_disallowed_sql.assert_not_called()
+
+
+def test_prepare_rejects_unsupported_csv_configuration(
+    mocker: MockerFixture,
+) -> None:
+    _, query_context, datasource = _setup_chart_mocks(mocker)
+    mocker.patch.dict(
+        current_app.config,
+        {"CSV_EXPORT": {"encoding": "utf-8", "compression": "gzip"}},
+    )
+
+    preparation = StreamingCSVExportCommand(query_context).prepare()
+
+    assert preparation.ineligibility == StreamingExportIneligibility.CSV_CONFIGURATION
+    datasource.get_query_str_extended.assert_not_called()
 
 
 def test_csv_generation_with_small_dataset(mocker: MockerFixture) -> None:
@@ -231,6 +401,116 @@ def test_streaming_with_null_values(mocker: MockerFixture) -> None:
     assert ",value2," in csv_data
 
 
+def test_streaming_escapes_spreadsheet_formulas(mocker: MockerFixture) -> None:
+    """Direct streaming applies the same CSV-injection defense as DataFrames."""
+    _, query_context, datasource = _setup_chart_mocks(mocker)
+    mock_result = mocker.MagicMock()
+    mock_result.keys.return_value = ["=header", "value"]
+    mock_result.fetchmany.side_effect = [
+        [("=1+1", "+cmd"), ("-2", "normal")],
+        [],
+    ]
+    connection = mocker.MagicMock()
+    connection.execution_options.return_value.execute.return_value = mock_result
+    connection.__enter__.return_value = connection
+    engine = mocker.MagicMock()
+    engine.dialect.supports_server_side_cursors = True
+    engine.connect.return_value = connection
+    datasource.database.get_sqla_engine.return_value.__enter__.return_value = engine
+
+    csv_data = "".join(StreamingCSVExportCommand(query_context).run()())
+
+    assert "'=header" in csv_data
+    assert "'=1+1" in csv_data
+    assert "'+cmd" in csv_data
+    assert "-2,normal" in csv_data
+
+
+def test_streaming_applies_engine_column_type_mutators(
+    mocker: MockerFixture,
+) -> None:
+    """Direct rows preserve the normal datasource value-normalization contract."""
+
+    class IntervalType:
+        pass
+
+    _, query_context, datasource = _setup_chart_mocks(mocker)
+    engine_spec = datasource.database.db_engine_spec
+    engine_spec.get_datatype.return_value = "INTERVAL"
+    engine_spec.get_sqla_column_type.return_value = IntervalType()
+    engine_spec.column_type_mutators = {IntervalType: lambda value: value * 1000}
+    mock_result = mocker.MagicMock()
+    mock_result.keys.return_value = ["duration"]
+    mock_result.cursor.description = [("duration", 1186)]
+    mock_result.fetchmany.side_effect = [[(2.5,)], []]
+    connection = mocker.MagicMock()
+    connection.execution_options.return_value.execute.return_value = mock_result
+    connection.__enter__.return_value = connection
+    engine = mocker.MagicMock()
+    engine.dialect.supports_server_side_cursors = True
+    engine.connect.return_value = connection
+    datasource.database.get_sqla_engine.return_value.__enter__.return_value = engine
+
+    csv_data = "".join(StreamingCSVExportCommand(query_context).run()())
+
+    assert "2500.0" in csv_data
+
+
+def test_streaming_applies_supported_csv_export_configuration(
+    mocker: MockerFixture,
+) -> None:
+    _, query_context, datasource = _setup_chart_mocks(mocker)
+    mocker.patch.dict(
+        current_app.config,
+        {
+            "CSV_EXPORT": {
+                "date_format": "%Y/%m/%d",
+                "encoding": "utf-8",
+                "float_format": "%.1f",
+                "lineterminator": "|\n",
+                "na_rep": "NULL",
+                "sep": ";",
+            }
+        },
+    )
+    mock_result = mocker.MagicMock()
+    mock_result.keys.return_value = ["missing", "amount", "event_date"]
+    mock_result.fetchmany.side_effect = [
+        [(None, 1.25, date(2026, 7, 10))],
+        [],
+    ]
+    connection = mocker.MagicMock()
+    connection.execution_options.return_value.execute.return_value = mock_result
+    connection.__enter__.return_value = connection
+    engine = mocker.MagicMock()
+    engine.dialect.supports_server_side_cursors = True
+    engine.connect.return_value = connection
+    datasource.database.get_sqla_engine.return_value.__enter__.return_value = engine
+
+    csv_data = "".join(StreamingCSVExportCommand(query_context).run()())
+
+    assert "missing;amount;event_date|\n" in csv_data
+    assert "NULL;1.2;2026/07/10|\n" in csv_data
+
+
+def test_direct_stream_error_is_not_written_into_csv(
+    mocker: MockerFixture,
+) -> None:
+    _, query_context, datasource = _setup_chart_mocks(mocker)
+    connection = mocker.MagicMock()
+    connection.execution_options.return_value.execute.side_effect = RuntimeError(
+        "database disconnected"
+    )
+    connection.__enter__.return_value = connection
+    engine = mocker.MagicMock()
+    engine.dialect.supports_server_side_cursors = True
+    engine.connect.return_value = connection
+    datasource.database.get_sqla_engine.return_value.__enter__.return_value = engine
+
+    with pytest.raises(RuntimeError, match="database disconnected"):
+        list(StreamingCSVExportCommand(query_context).run()())
+
+
 def test_streaming_execution_options_enabled(mocker: MockerFixture) -> None:
     """Test that streaming execution options are enabled."""
     mock_db, query_context, datasource = _setup_chart_mocks(mocker)
@@ -325,7 +605,8 @@ def test_catalog_and_schema_passed_to_engine(mocker: MockerFixture) -> None:
     command = StreamingCSVExportCommand(query_context)
     list(command.run()())
 
-    datasource.database.get_sqla_engine.assert_called_once_with(
-        catalog="my_catalog",
-        schema="my_schema",
-    )
+    assert datasource.database.get_sqla_engine.call_count == 2
+    assert datasource.database.get_sqla_engine.call_args_list == [
+        mocker.call(catalog="my_catalog", schema="my_schema"),
+        mocker.call(catalog="my_catalog", schema="my_schema"),
+    ]

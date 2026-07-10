@@ -489,6 +489,10 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
     # Needed on certain databases that return values in an unexpected format
     column_type_mutators: dict[TypeEngine, Callable[[Any], Any]] = {}
 
+    # Direct CSV streaming is opt-in because a server-side cursor alone does not
+    # prove that driver rows are equivalent to SupersetResultSet normalization.
+    supports_direct_csv_streaming = False
+
     # Does database support join-free timeslot grouping
     time_groupby_inline = False
     limit_method = LimitMethod.FORCE_LIMIT

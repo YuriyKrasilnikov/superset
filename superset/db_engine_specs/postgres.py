@@ -272,6 +272,7 @@ class PostgresBaseEngineSpec(BaseEngineSpec):
 
 class PostgresEngineSpec(BasicParametersMixin, PostgresBaseEngineSpec):
     engine = "postgresql"
+    supports_direct_csv_streaming = True
     engine_name = "PostgreSQL"
     engine_aliases = {"postgres"}
 
