@@ -19,46 +19,28 @@
 from __future__ import annotations
 
 import codecs
-import csv
-import io
 import logging
-import math
 import time
 from abc import abstractmethod
-from contextlib import contextmanager
-from datetime import date, datetime
-from decimal import Decimal
-from numbers import Integral, Real
-from typing import Any, Callable, Generator
+from typing import Any, Generator
 
-from flask import current_app as app, g, has_app_context
+import pandas as pd
+from flask import current_app as app
 from sqlalchemy import text
 
 from superset import db
 from superset.commands.base import BaseCommand
+from superset.exceptions import QueryObjectValidationError
 from superset.extensions import event_logger, security_manager
-from superset.utils import json
-from superset.utils.csv import escape_value
+from superset.result_set import (
+    dedup,
+    normalize_cursor_description_names,
+    SupersetResultSet,
+)
+from superset.superset_typing import DbapiDescription
+from superset.utils import csv as csv_utils
 
 logger = logging.getLogger(__name__)
-
-
-@contextmanager
-def preserve_g_context(
-    captured_g: dict[str, Any],
-) -> Generator[None, None, None]:
-    """
-    Context manager that restores captured flask.g attributes.
-
-    This is needed for streaming responses where the generator runs in a new
-    app context but needs access to request-scoped data from the original request.
-
-    Args:
-        captured_g: Dictionary of g attributes captured before context switch
-    """
-    for key, value in captured_g.items():
-        setattr(g, key, value)
-    yield
 
 
 class BaseStreamingCSVExportCommand(BaseCommand):
@@ -84,7 +66,7 @@ class BaseStreamingCSVExportCommand(BaseCommand):
             chunk_size: Number of rows to fetch per database query (default: 1000)
         """
         self._chunk_size = chunk_size
-        self._current_app = app._get_current_object()
+        self._rows_streamed = 0
 
     _supported_csv_export_keys = frozenset(
         {
@@ -102,44 +84,18 @@ class BaseStreamingCSVExportCommand(BaseCommand):
         }
     )
 
-    @staticmethod
-    def _csv_writer_options(config: dict[str, Any]) -> dict[str, Any]:
-        key_map = {
-            "sep": "delimiter",
-            "quotechar": "quotechar",
-            "quoting": "quoting",
-            "lineterminator": "lineterminator",
-            "doublequote": "doublequote",
-            "escapechar": "escapechar",
-        }
-        options = {
-            writer_key: config[config_key]
-            for config_key, writer_key in key_map.items()
-            if config_key in config
-        }
-        options.setdefault("lineterminator", "\n")
-        return options
-
     @classmethod
     def supports_csv_export_config(cls, config: dict[str, Any]) -> bool:
-        """Return whether the incremental writer can reproduce this config."""
+        """Return whether bounded pandas chunks can reproduce this config."""
         if not set(config).issubset(cls._supported_csv_export_keys):
-            return False
-        decimal = config.get("decimal", ".")
-        if not isinstance(decimal, str) or len(decimal) != 1:
-            return False
-        if (date_format := config.get("date_format")) is not None and not isinstance(
-            date_format, str
-        ):
-            return False
-        float_format = config.get("float_format")
-        if float_format is not None and not (
-            isinstance(float_format, str) or callable(float_format)
-        ):
             return False
         try:
             codecs.lookup(str(config.get("encoding", "utf-8")))
-            csv.writer(io.StringIO(), **cls._csv_writer_options(config))
+            csv_utils.df_to_escaped_csv(
+                pd.DataFrame(),
+                index=False,
+                **config,
+            )
         except (LookupError, TypeError, ValueError):
             return False
         return True
@@ -162,99 +118,56 @@ class BaseStreamingCSVExportCommand(BaseCommand):
             Row limit or None for unlimited
         """
 
-    def _write_csv_header(
-        self, columns: list[str], csv_writer: Any, buffer: io.StringIO
-    ) -> tuple[str, int]:
-        """Write CSV header and return header data with byte count."""
-        csv_writer.writerow([escape_value(column) for column in columns])
-        header_data = buffer.getvalue()
-        total_bytes = len(header_data.encode("utf-8"))
-        buffer.seek(0)
-        buffer.truncate()
-        return header_data, total_bytes
-
     @staticmethod
-    def _format_value(
-        value: Any,
-        decimal_separator: str | None,
-        csv_export_config: dict[str, Any],
-    ) -> Any:
-        na_rep = escape_value(str(csv_export_config.get("na_rep", "")))
-        if value is None:
-            return na_rep
-        if isinstance(value, (dict, list)):
-            return json.dumps(value, default=json.json_int_dttm_ser)
-        if (
-            isinstance(value, (Decimal, Real))
-            and not isinstance(value, bool)
-            and math.isinf(value)
-        ):
-            return na_rep
-        if (
-            (date_format := csv_export_config.get("date_format"))
-            and isinstance(value, (date, datetime))
-        ):
-            return escape_value(value.strftime(str(date_format)))
-        if (
-            (float_format := csv_export_config.get("float_format"))
-            and isinstance(value, Real)
-            and not isinstance(value, (bool, Integral))
-        ):
-            value = (
-                float_format(value)
-                if callable(float_format)
-                else str(float_format) % value
-            )
-        if isinstance(value, str):
-            if decimal_separator and decimal_separator != ".":
-                value = value.replace(".", decimal_separator)
-            return escape_value(value)
-        if (
-            decimal_separator
-            and decimal_separator != "."
-            and isinstance(value, (float, Decimal, Real))
-            and not isinstance(value, bool)
-        ):
-            return str(value).replace(".", decimal_separator)
-        return value
-
-    def _format_row_values(
-        self,
-        row: tuple[Any, ...],
-        decimal_separator: str | None,
-        column_mutators: dict[int, Callable[[Any], Any]],
-        csv_export_config: dict[str, Any],
-    ) -> list[Any]:
-        """Normalize and format one database row for incremental CSV output."""
+    def _get_cursor_description(result_proxy: Any) -> DbapiDescription:
+        """Return a concrete DBAPI description, falling back to result keys."""
+        cursor = getattr(result_proxy, "cursor", None)
+        description = getattr(cursor, "description", None)
+        try:
+            concrete_description = list(description or ())
+        except TypeError:
+            concrete_description = []
+        if concrete_description:
+            return concrete_description
         return [
-            self._format_value(
-                mutator(value) if (mutator := column_mutators.get(index)) else value,
-                decimal_separator,
-                csv_export_config,
-            )
-            for index, value in enumerate(row)
+            (str(column), "", None, None, None, None, False)
+            for column in result_proxy.keys()
         ]
 
     def _get_output_columns(self, result_proxy: Any) -> list[str]:
         """Return public columns in their final CSV order."""
-        return list(result_proxy.keys())
+        description = self._get_cursor_description(result_proxy)
+        return dedup(normalize_cursor_description_names(description))
 
-    @staticmethod
-    def _get_column_mutators(
-        result_proxy: Any, database: Any
-    ) -> dict[int, Callable[[Any], Any]]:
-        """Resolve the same engine-specific value mutators as fetch_data()."""
-        cursor = getattr(result_proxy, "cursor", None)
-        description = getattr(cursor, "description", None) or []
-        engine_spec = database.db_engine_spec
-        mutators: dict[int, Callable[[Any], Any]] = {}
-        for index, column in enumerate(description):
-            sqla_type = engine_spec.get_sqla_column_type(
-                engine_spec.get_datatype(column[1])
-            )
-            if mutator := engine_spec.column_type_mutators.get(type(sqla_type)):
-                mutators[index] = mutator
-        return mutators
+    def _normalize_dataframe(
+        self,
+        dataframe: pd.DataFrame,
+        database: Any,
+        output_columns: list[str],
+    ) -> pd.DataFrame:
+        """Apply the canonical materialized-result normalization boundary."""
+        dataframe = database.post_process_df(dataframe)
+        if len(dataframe.columns) < len(output_columns):
+            raise ValueError("Database returned fewer columns than the CSV contract")
+        dataframe = dataframe.iloc[:, : len(output_columns)].copy()
+        dataframe.columns = output_columns
+        return dataframe
+
+    def _dataframe_from_rows(
+        self,
+        rows: list[Any],
+        result_proxy: Any,
+        database: Any,
+        output_columns: list[str],
+    ) -> pd.DataFrame:
+        """Build one bounded DataFrame through Superset's canonical result set."""
+        description = self._get_cursor_description(result_proxy)
+        dataframe = SupersetResultSet(
+            rows,
+            description,
+            database.db_engine_spec,
+        ).to_pandas_df()
+        return self._normalize_dataframe(dataframe, database, output_columns)
 
     def _emit_stream_error_marker(self) -> bool:
         """Whether legacy clients require an in-band stream error marker."""
@@ -263,63 +176,38 @@ class BaseStreamingCSVExportCommand(BaseCommand):
     def _process_rows(
         self,
         result_proxy: Any,
-        csv_writer: Any,
-        buffer: io.StringIO,
+        database: Any,
+        output_columns: list[str],
+        csv_export_config: dict[str, Any],
         limit: int | None,
-        decimal_separator: str | None = None,
-        column_count: int | None = None,
-        column_mutators: dict[int, Callable[[Any], Any]] | None = None,
-        csv_export_config: dict[str, Any] | None = None,
-    ) -> Generator[tuple[str, int, int], None, None]:
-        """
-        Process database rows and yield CSV data chunks.
-
-        Args:
-            result_proxy: SQLAlchemy result proxy
-            csv_writer: CSV writer instance
-            buffer: StringIO buffer for CSV data
-            limit: Maximum number of rows to process, or None for unlimited
-            decimal_separator: Custom decimal separator (e.g., ",") or None
-
-        Yields tuples of (data_chunk, row_count, byte_count).
-        """
+    ) -> Generator[str, None, None]:
+        """Normalize and serialize bounded row chunks without semantic drift."""
         row_count = 0
-        flush_threshold = 65536  # 64KB
-
-        while rows := result_proxy.fetchmany(self._chunk_size):
-            for row in rows:
-                # Apply limit if specified
-                if limit is not None and row_count >= limit:
-                    break
-
-                # Format values with custom decimal separator if needed
-                output_row = row[:column_count] if column_count is not None else row
-                formatted_row = self._format_row_values(
-                    output_row,
-                    decimal_separator,
-                    column_mutators or {},
-                    csv_export_config or {},
-                )
-                csv_writer.writerow(formatted_row)
-                row_count += 1
-
-                # Check buffer size and flush if needed
-                current_size = buffer.tell()
-                if current_size >= flush_threshold:
-                    data = buffer.getvalue()
-                    data_bytes = len(data.encode("utf-8"))
-                    yield data, row_count, data_bytes
-                    buffer.seek(0)
-                    buffer.truncate()
-
-            # Break outer loop if limit reached
-            if limit is not None and row_count >= limit:
+        while limit is None or row_count < limit:
+            remaining = None if limit is None else max(limit - row_count, 0)
+            fetch_size = (
+                self._chunk_size
+                if remaining is None
+                else min(self._chunk_size, remaining)
+            )
+            rows = result_proxy.fetchmany(fetch_size)
+            if not rows:
                 break
-
-        # Flush remaining buffer
-        if remaining_data := buffer.getvalue():
-            data_bytes = len(remaining_data.encode("utf-8"))
-            yield remaining_data, row_count, data_bytes
+            bounded_rows = list(rows if remaining is None else rows[:remaining])
+            dataframe = self._dataframe_from_rows(
+                bounded_rows,
+                result_proxy,
+                database,
+                output_columns,
+            )
+            row_count += len(dataframe.index)
+            self._rows_streamed = row_count
+            yield csv_utils.df_to_escaped_csv(
+                dataframe,
+                index=False,
+                header=False,
+                **csv_export_config,
+            )
 
     def _execute_query_and_stream(
         self,
@@ -330,27 +218,11 @@ class BaseStreamingCSVExportCommand(BaseCommand):
         schema: str | None = None,
     ) -> Generator[str, None, None]:
         """Execute query with streaming and yield CSV chunks."""
-        start_time = time.time()
-        total_bytes = 0
-
-        # Get CSV export configuration. CSV_EXPORT has an explicit default in
-        # config.py, so index directly rather than using .get() with a hardcoded
-        # fallback that would silently mask a misconfiguration removing the key.
-        #
-        # The streaming path only honors the `sep` and `decimal` keys from
-        # CSV_EXPORT. Unlike the non-streaming path in
-        # superset.charts.client_processing (which builds the whole file with a
-        # single DataFrame.to_csv(**CSV_EXPORT) call), this path writes rows
-        # incrementally via csv.writer, so the remaining pandas to_csv kwargs
-        # (e.g. quotechar, lineterminator, encoding) do not map onto it and are
-        # intentionally not applied here.
+        start_time = time.perf_counter()
         csv_export_config = app.config["CSV_EXPORT"]
-        decimal_separator = csv_export_config.get("decimal", ".")
 
         with db.session() as session:
-            # Merge database to prevent DetachedInstanceError
             merged_database = session.merge(database)
-
             with merged_database.get_sqla_engine(
                 catalog=catalog, schema=schema
             ) as engine:
@@ -371,86 +243,74 @@ class BaseStreamingCSVExportCommand(BaseCommand):
                         result_proxy = connection.execution_options(
                             stream_results=True
                         ).execute(text(sql))
+                        output_columns = self._get_output_columns(result_proxy)
+                        yield csv_utils.df_to_escaped_csv(
+                            pd.DataFrame(columns=output_columns),
+                            index=False,
+                            **csv_export_config,
+                        )
+                        yield from self._process_rows(
+                            result_proxy,
+                            merged_database,
+                            output_columns,
+                            csv_export_config,
+                            limit,
+                        )
 
-                    columns = self._get_output_columns(result_proxy)
-                    column_mutators = self._get_column_mutators(
-                        result_proxy, merged_database
-                    )
+        logger.info(
+            "Streaming CSV query completed: %s rows in %.2fs",
+            f"{self._rows_streamed:,}",
+            time.perf_counter() - start_time,
+        )
 
-                    # Use StringIO with csv.writer for proper escaping
-                    # Apply delimiter from CSV_EXPORT config
-                    buffer = io.StringIO()
-                    csv_writer = csv.writer(
-                        buffer, **self._csv_writer_options(csv_export_config)
-                    )
-
-                    # Write CSV header
-                    header_data, header_bytes = self._write_csv_header(
-                        columns, csv_writer, buffer
-                    )
-                    total_bytes += header_bytes
-                    yield header_data
-
-                    # Process rows and yield chunks
-                    row_count = 0
-                    for data_chunk, rows_processed, chunk_bytes in self._process_rows(
-                        result_proxy,
-                        csv_writer,
-                        buffer,
-                        limit,
-                        decimal_separator,
-                        len(columns),
-                        column_mutators,
-                        csv_export_config,
-                    ):
-                        total_bytes += chunk_bytes
-                        row_count = rows_processed
-                        yield data_chunk
-
-                    # Log completion
-                    total_time = time.time() - start_time
-                    total_mb = total_bytes / (1024 * 1024)
-                    logger.info(
-                        "Streaming CSV completed: %s rows, %.1fMB in %.2fs",
-                        f"{row_count:,}",
-                        total_mb,
-                        total_time,
-                    )
-
-    def run(self) -> Callable[[], Generator[str, None, None]]:
+    def run(self) -> Generator[bytes, None, None]:
         """
         Execute the streaming CSV export.
 
         Returns:
-            A callable that returns a generator yielding CSV data chunks as strings.
-            The callable is needed to maintain Flask app context during streaming.
+            Encoded CSV chunks. The response owner must keep the Flask request
+            context active while iterating them.
         """
-        # Load all needed data while session is still active
-        # to avoid DetachedInstanceError
+        csv_export_config = app.config["CSV_EXPORT"]
+        if not self.supports_csv_export_config(csv_export_config):
+            raise QueryObjectValidationError(
+                "CSV_EXPORT contains options unsupported by bounded streaming"
+            )
         sql, database, catalog, schema = self._get_sql_and_database()
         limit = self._get_row_limit()
-        # Capture flask.g attributes to preserve request-scoped data
-        # when the streaming generator runs in a new app context.
-        captured_g = (
-            g._get_current_object().__dict__.copy() if has_app_context() else {}
-        )
+        encoding = str(csv_export_config.get("encoding", "utf-8"))
 
-        def csv_generator() -> Generator[str, None, None]:
-            """Generator that yields CSV data chunks."""
-            with self._current_app.app_context():
-                with preserve_g_context(captured_g):
-                    try:
-                        yield from self._execute_query_and_stream(
-                            sql, database, limit, catalog, schema
-                        )
-                    except Exception as e:
-                        logger.exception("Error in streaming CSV generator: %s", e)
-                        if self._emit_stream_error_marker():
-                            yield (
-                                "__STREAM_ERROR__:Export failed. "
-                                "Please try again in some time.\n"
-                            )
-                        else:
-                            raise
+        def csv_generator() -> Generator[bytes, None, None]:
+            """Encode the entire stream with one stateful codec instance."""
+            encoder = codecs.getincrementalencoder(encoding)()
+            total_bytes = 0
+            started = time.perf_counter()
+            try:
+                for chunk in self._execute_query_and_stream(
+                    sql, database, limit, catalog, schema
+                ):
+                    encoded = encoder.encode(chunk)
+                    total_bytes += len(encoded)
+                    if encoded:
+                        yield encoded
+                if final_chunk := encoder.encode("", final=True):
+                    total_bytes += len(final_chunk)
+                    yield final_chunk
+            except Exception as ex:
+                logger.exception("Error in streaming CSV generator: %s", ex)
+                if not self._emit_stream_error_marker():
+                    raise
+                marker = encoder.encode(
+                    "__STREAM_ERROR__:Export failed. Please try again in some time.\n",
+                    final=True,
+                )
+                total_bytes += len(marker)
+                yield marker
+            finally:
+                logger.info(
+                    "Streaming CSV response completed: %.1fMB in %.2fs",
+                    total_bytes / (1024 * 1024),
+                    time.perf_counter() - started,
+                )
 
-        return csv_generator
+        return csv_generator()

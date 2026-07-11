@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, cast, Protocol, TYPE_CHECKING
 
+import pandas as pd
 from flask import current_app
 
 from superset.commands.streaming_export.base import BaseStreamingCSVExportCommand
@@ -93,6 +94,10 @@ class SQLStreamingDatasource(Protocol):
     def _collect_dttm_labels(
         self, query_object: QueryObject
     ) -> tuple[tuple[str, str | None], ...]: ...
+
+    def normalize_df(
+        self, dataframe: pd.DataFrame, query_object: QueryObject
+    ) -> pd.DataFrame: ...
 
 
 class StreamingCSVExportCommand(BaseStreamingCSVExportCommand):
@@ -211,8 +216,12 @@ class StreamingCSVExportCommand(BaseStreamingCSVExportCommand):
         query_str_ext = sql_datasource.get_query_str_extended(
             query_obj.to_dict(),
             mutate=True,
-            defer_source_queries=False,
+            defer_source_queries=True,
         )
+        if query_str_ext.deferred or query_str_ext.prequeries:
+            return StreamingExportPreparation(
+                ineligibility=StreamingExportIneligibility.QUERY_DEPENDENCY
+            )
         sql = database.mutate_sql_based_on_config(
             query_str_ext.sql,
             is_split=True,
@@ -257,6 +266,25 @@ class StreamingCSVExportCommand(BaseStreamingCSVExportCommand):
                 "Database did not return all columns required by the export"
             )
         return labels
+
+    def _normalize_dataframe(
+        self,
+        dataframe: pd.DataFrame,
+        database: Any,
+        output_columns: list[str],
+    ) -> pd.DataFrame:
+        """Apply the same datasource normalization as materialized chart data."""
+        dataframe = super()._normalize_dataframe(
+            dataframe,
+            database,
+            output_columns,
+        )
+        datasource = self._get_sql_datasource()
+        if datasource is None:
+            raise QueryObjectValidationError(
+                "Chart datasource cannot normalize streamed results"
+            )
+        return datasource.normalize_df(dataframe, self._query_context.queries[0])
 
     def _emit_stream_error_marker(self) -> bool:
         # A marker is valid neither CSV nor a reliable transport status. Let the

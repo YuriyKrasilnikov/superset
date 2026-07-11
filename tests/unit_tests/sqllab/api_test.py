@@ -29,11 +29,11 @@ def _disposition_filename(form_filename: str | None) -> str:
     app = Flask(__name__)
     app.config["CSV_EXPORT"] = {"encoding": "utf-8"}
     with (
-        app.app_context(),
+        app.test_request_context(),
         patch("superset.sqllab.api.StreamingSqlResultExportCommand") as command_cls,
     ):
         command = command_cls.return_value
-        command.run.return_value = lambda: iter([b""])
+        command.run.return_value = iter([b""])
         response = SqlLabRestApi._create_streaming_csv_response(
             MagicMock(), client_id="abc123", filename=form_filename
         )

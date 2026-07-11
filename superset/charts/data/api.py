@@ -16,13 +16,19 @@
 # under the License.
 from __future__ import annotations
 
-import codecs
 import contextlib
 import logging
 from datetime import datetime
 from typing import Any, Callable, TYPE_CHECKING
 
-from flask import current_app as app, g, make_response, request, Response
+from flask import (
+    current_app as app,
+    g,
+    make_response,
+    request,
+    Response,
+    stream_with_context,
+)
 from flask_appbuilder.api import expose, protect
 from flask_babel import gettext as _
 from marshmallow import ValidationError
@@ -45,6 +51,11 @@ from superset.charts.data.timing import (
 from superset.charts.schemas import ChartDataQueryContextSchema
 from superset.commands.chart.data.create_async_job_command import (
     CreateAsyncChartDataJobCommand,
+)
+from superset.commands.chart.data.export_planner import (
+    ChartDataExportMode,
+    ChartDataExportPlan,
+    ChartDataExportPlanner,
 )
 from superset.commands.chart.data.get_data_command import (
     ChartDataCommand,
@@ -611,29 +622,35 @@ class ChartDataRestApi(ChartRestApi):
         ):
             return self.response_403()
 
-        if self._should_attempt_direct_streaming(
-            query_context, form_data, expected_rows
-        ):
-            streaming_command = StreamingCSVExportCommand(
-                query_context, chunk_size=1024
-            )
-            try:
-                preparation = streaming_command.prepare()
-                if preparation.eligible:
-                    return self._create_streaming_csv_response(
-                        streaming_command,
-                        form_data,
-                        filename=filename,
-                        expected_rows=expected_rows,
-                    )
-                logger.info(
-                    "Chart CSV direct streaming is ineligible: %s",
-                    preparation.ineligibility,
+        try:
+            plan = ChartDataExportPlanner(
+                query_context,
+                optimize_requested=self._should_attempt_direct_streaming(
+                    query_context,
+                    form_data,
+                    expected_rows,
+                ),
+                direct_command_factory=lambda: StreamingCSVExportCommand(
+                    query_context,
+                    chunk_size=1024,
+                ),
+            ).plan()
+            if query_context.result_format == ChartDataResultFormat.CSV:
+                self._record_export_plan(plan)
+            if (
+                plan.mode == ChartDataExportMode.DIRECT
+                and plan.direct_command is not None
+            ):
+                return self._create_streaming_csv_response(
+                    plan.direct_command,
+                    form_data,
+                    filename=filename,
+                    expected_rows=expected_rows,
                 )
-            except SupersetSecurityException:
-                return self.response_403()
-            except (QueryObjectValidationError, SupersetException) as exc:
-                return self.response_400(message=str(exc))
+        except SupersetSecurityException:
+            return self.response_403()
+        except (QueryObjectValidationError, SupersetException) as exc:
+            return self.response_400(message=str(exc))
 
         try:
             with chart_timing_phase("query"):
@@ -747,6 +764,24 @@ class ChartDataRestApi(ChartRestApi):
                 row_estimate = None
         return row_estimate is not None and row_estimate >= threshold
 
+    @staticmethod
+    def _record_export_plan(plan: ChartDataExportPlan) -> None:
+        """Emit bounded transport diagnostics without query or user content."""
+        stats_logger = app.config["STATS_LOGGER"]
+        stats_logger.incr(f"chart_data.export.transport.{plan.mode.value}")
+        ineligibility = (
+            plan.direct_ineligibility.value
+            if plan.direct_ineligibility is not None
+            else None
+        )
+        logger.info(
+            "Chart CSV export plan selected: mode=%s, direct_ineligibility=%s",
+            plan.mode.value,
+            ineligibility,
+        )
+        if ineligibility is not None:
+            stats_logger.incr(f"chart_data.export.direct_ineligible.{ineligibility}")
+
     def _create_streaming_csv_response(
         self,
         command: StreamingCSVExportCommand,
@@ -778,26 +813,11 @@ class ChartDataRestApi(ChartRestApi):
 
         command.validate()
 
-        # Get the callable that returns the generator
-        csv_generator_callable = command.run()
-
-        # Get encoding from config
+        csv_generator = command.run()
         encoding = app.config.get("CSV_EXPORT", {}).get("encoding", "utf-8")
 
-        # Create response with streaming headers
-        encoder = codecs.getincrementalencoder(encoding)()
-
-        def encoded_csv_generator() -> Any:
-            for chunk in csv_generator_callable():
-                if isinstance(chunk, bytes):
-                    yield chunk
-                else:
-                    yield encoder.encode(chunk)
-            if final_chunk := encoder.encode("", final=True):
-                yield final_chunk
-
         response = Response(
-            encoded_csv_generator(),
+            stream_with_context(csv_generator),
             # Use content_type (not mimetype) so the charset is set verbatim;
             # passing a charset via mimetype makes Werkzeug append a second
             # charset, producing a malformed doubled Content-Type header.

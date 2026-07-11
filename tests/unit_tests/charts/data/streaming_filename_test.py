@@ -17,6 +17,7 @@
 from unittest.mock import MagicMock
 
 import pytest
+from flask import Flask
 
 
 def _build_response(filename: str | None):
@@ -24,8 +25,11 @@ def _build_response(filename: str | None):
 
     api = ChartDataRestApi.__new__(ChartDataRestApi)
     command = MagicMock()
-    command.run.return_value = lambda: iter(["a,b\n"])
-    return api._create_streaming_csv_response(command, filename=filename)
+    command.run.return_value = iter([b"\xef\xbb\xbfa,b\n"])
+    app = Flask(__name__)
+    app.config["CSV_EXPORT"] = {"encoding": "utf-8-sig"}
+    with app.test_request_context():
+        return api._create_streaming_csv_response(command, filename=filename)
 
 
 @pytest.mark.parametrize(

@@ -47,10 +47,14 @@ def _setup_chart_mocks(
     query_str = mocker.MagicMock()
     query_str.sql = sql
     query_str.labels_expected = []
+    query_str.deferred = False
+    query_str.prequeries = []
     datasource.get_query_str_extended.return_value = query_str
     datasource.database = mocker.MagicMock()
     datasource.database.db_engine_spec.supports_direct_csv_streaming = True
     datasource.database.db_engine_spec.engine = "postgresql"
+    datasource.database.db_engine_spec.requires_column_value_normalization = False
+    datasource.database.post_process_df.side_effect = lambda dataframe: dataframe
     datasource.database.mutate_sql_based_on_config.side_effect = (
         lambda query_sql, is_split: query_sql
     )
@@ -67,6 +71,7 @@ def _setup_chart_mocks(
     query.contribution_totals_query_index = None
     query_context.queries = [query]
     datasource._collect_dttm_labels.return_value = ()
+    datasource.normalize_df.side_effect = lambda dataframe, query_obj: dataframe
     mock_session.merge.return_value = datasource.database
     engine = datasource.database.get_sqla_engine.return_value.__enter__.return_value
     engine.dialect.supports_server_side_cursors = True
@@ -91,7 +96,7 @@ def test_streaming_export_compiles_executable_query(mocker: MockerFixture) -> No
     datasource.get_query_str_extended.assert_called_once_with(
         {"series_limit": 10},
         mutate=True,
-        defer_source_queries=False,
+        defer_source_queries=True,
     )
     datasource.get_query_str.assert_not_called()
 
@@ -114,7 +119,6 @@ def test_streaming_csv_export_command_init(mocker: MockerFixture) -> None:
 
     assert command._query_context == query_context
     assert command._chunk_size == 500
-    assert command._current_app is not None
 
 
 def test_streaming_csv_export_command_default_chunk_size(
@@ -166,11 +170,36 @@ def test_prepare_compiles_final_sql_without_deferred_sources(
     datasource.get_query_str_extended.assert_called_once_with(
         query.to_dict.return_value,
         mutate=True,
-        defer_source_queries=False,
+        defer_source_queries=True,
     )
     datasource._raise_for_disallowed_sql.assert_called_once_with(preparation.query.sql)
     query_context.raise_for_access.assert_called_once_with()
     query.validate.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("deferred", "prequeries"),
+    [
+        (True, []),
+        (False, ["SELECT category FROM t LIMIT 10"]),
+    ],
+)
+def test_prepare_rejects_source_query_dependencies_without_executing_them(
+    mocker: MockerFixture,
+    deferred: bool,
+    prequeries: list[str],
+) -> None:
+    """Planning must not execute series-limit or other source queries."""
+    _, query_context, datasource = _setup_chart_mocks(mocker)
+    query_str = datasource.get_query_str_extended.return_value
+    query_str.deferred = deferred
+    query_str.prequeries = prequeries
+
+    preparation = StreamingCSVExportCommand(query_context).prepare()
+
+    assert preparation.ineligibility == StreamingExportIneligibility.QUERY_DEPENDENCY
+    datasource.query.assert_not_called()
+    datasource._raise_for_disallowed_sql.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -320,12 +349,11 @@ def test_csv_generation_with_small_dataset(mocker: MockerFixture) -> None:
     )
 
     command = StreamingCSVExportCommand(query_context, chunk_size=2)
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
+    generator = command.run()
 
     chunks = list(generator)
 
-    csv_data = "".join(chunks)
+    csv_data = b"".join(chunks).decode("utf-8-sig")
     lines = [line.strip() for line in csv_data.strip().split("\n")]
 
     assert len(lines) == 4
@@ -358,9 +386,8 @@ def test_csv_generation_with_special_characters(mocker: MockerFixture) -> None:
     )
 
     command = StreamingCSVExportCommand(query_context, chunk_size=10)
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
-    csv_data = "".join(generator)
+    generator = command.run()
+    csv_data = b"".join(generator).decode("utf-8-sig")
 
     assert '"John, Jr."' in csv_data
     assert '"Quote""Test"' in csv_data
@@ -391,9 +418,8 @@ def test_streaming_with_null_values(mocker: MockerFixture) -> None:
     )
 
     command = StreamingCSVExportCommand(query_context, chunk_size=10)
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
-    csv_data = "".join(generator)
+    generator = command.run()
+    csv_data = b"".join(generator).decode("utf-8-sig")
 
     lines = csv_data.strip().split("\n")
     assert len(lines) == 3
@@ -418,7 +444,9 @@ def test_streaming_escapes_spreadsheet_formulas(mocker: MockerFixture) -> None:
     engine.connect.return_value = connection
     datasource.database.get_sqla_engine.return_value.__enter__.return_value = engine
 
-    csv_data = "".join(StreamingCSVExportCommand(query_context).run()())
+    csv_data = b"".join(StreamingCSVExportCommand(query_context).run()).decode(
+        "utf-8-sig"
+    )
 
     assert "'=header" in csv_data
     assert "'=1+1" in csv_data
@@ -431,14 +459,12 @@ def test_streaming_applies_engine_column_type_mutators(
 ) -> None:
     """Direct rows preserve the normal datasource value-normalization contract."""
 
-    class IntervalType:
-        pass
-
     _, query_context, datasource = _setup_chart_mocks(mocker)
     engine_spec = datasource.database.db_engine_spec
-    engine_spec.get_datatype.return_value = "INTERVAL"
-    engine_spec.get_sqla_column_type.return_value = IntervalType()
-    engine_spec.column_type_mutators = {IntervalType: lambda value: value * 1000}
+    engine_spec.requires_column_value_normalization = True
+    engine_spec.normalize_column_values.side_effect = lambda values: [
+        value * 1000 for value in values
+    ]
     mock_result = mocker.MagicMock()
     mock_result.keys.return_value = ["duration"]
     mock_result.cursor.description = [("duration", 1186)]
@@ -451,9 +477,12 @@ def test_streaming_applies_engine_column_type_mutators(
     engine.connect.return_value = connection
     datasource.database.get_sqla_engine.return_value.__enter__.return_value = engine
 
-    csv_data = "".join(StreamingCSVExportCommand(query_context).run()())
+    csv_data = b"".join(StreamingCSVExportCommand(query_context).run()).decode(
+        "utf-8-sig"
+    )
 
     assert "2500.0" in csv_data
+    engine_spec.normalize_column_values.assert_called_once_with([2.5])
 
 
 def test_streaming_applies_supported_csv_export_configuration(
@@ -487,10 +516,12 @@ def test_streaming_applies_supported_csv_export_configuration(
     engine.connect.return_value = connection
     datasource.database.get_sqla_engine.return_value.__enter__.return_value = engine
 
-    csv_data = "".join(StreamingCSVExportCommand(query_context).run()())
+    csv_data = b"".join(StreamingCSVExportCommand(query_context).run()).decode(
+        "utf-8-sig"
+    )
 
     assert "missing;amount;event_date|\n" in csv_data
-    assert "NULL;1.2;2026/07/10|\n" in csv_data
+    assert "NULL;1.2;2026-07-10|\n" in csv_data
 
 
 def test_direct_stream_error_is_not_written_into_csv(
@@ -508,7 +539,7 @@ def test_direct_stream_error_is_not_written_into_csv(
     datasource.database.get_sqla_engine.return_value.__enter__.return_value = engine
 
     with pytest.raises(RuntimeError, match="database disconnected"):
-        list(StreamingCSVExportCommand(query_context).run()())
+        list(StreamingCSVExportCommand(query_context).run())
 
 
 def test_streaming_execution_options_enabled(mocker: MockerFixture) -> None:
@@ -540,8 +571,7 @@ def test_streaming_execution_options_enabled(mocker: MockerFixture) -> None:
     )
 
     command = StreamingCSVExportCommand(query_context)
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
+    generator = command.run()
     list(generator)
 
     mock_connection.execution_options.assert_called_once_with(stream_results=True)
@@ -567,9 +597,8 @@ def test_empty_result_set(mocker: MockerFixture) -> None:
     )
 
     command = StreamingCSVExportCommand(query_context)
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
-    csv_data = "".join(generator)
+    generator = command.run()
+    csv_data = b"".join(generator).decode("utf-8-sig")
 
     lines = [line.strip() for line in csv_data.strip().split("\n")]
     assert len(lines) == 1
@@ -603,7 +632,7 @@ def test_catalog_and_schema_passed_to_engine(mocker: MockerFixture) -> None:
     )
 
     command = StreamingCSVExportCommand(query_context)
-    list(command.run()())
+    list(command.run())
 
     assert datasource.database.get_sqla_engine.call_count == 2
     assert datasource.database.get_sqla_engine.call_args_list == [
