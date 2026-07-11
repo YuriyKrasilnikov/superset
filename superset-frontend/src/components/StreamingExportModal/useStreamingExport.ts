@@ -19,6 +19,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { JsonObject, SupersetClient } from '@superset-ui/core';
 import { ExportStatus, StreamingProgress } from './StreamingExportModal';
+import { getFilenameFromResponse } from 'src/utils/export';
 import { makeUrl } from 'src/utils/navigationUtils';
 import { applicationRoot } from 'src/utils/getBootstrapData';
 
@@ -63,22 +64,28 @@ interface WritableFileStream {
 }
 
 interface WritableFileHandle {
+  readonly name: string;
   createWritable(): Promise<WritableFileStream>;
 }
 
-interface SaveFilePickerWindow extends Window {
-  showSaveFilePicker?: (options: {
-    suggestedName: string;
-    types: Array<{
-      description: string;
-      accept: Record<string, string[]>;
-    }>;
-  }) => Promise<WritableFileHandle>;
+interface WritableDirectoryHandle {
+  getFileHandle(
+    name: string,
+    options?: { create?: boolean },
+  ): Promise<WritableFileHandle>;
+  removeEntry(name: string): Promise<void>;
+}
+
+interface DirectoryPickerWindow extends Window {
+  showDirectoryPicker?: (options: {
+    id: string;
+    mode: 'readwrite';
+    startIn: 'downloads';
+  }) => Promise<WritableDirectoryHandle>;
 }
 
 export type PreparedExportTarget =
-  | { kind: 'file-system'; handle: WritableFileHandle }
-  | { kind: 'blob' };
+  { kind: 'directory'; handle: WritableDirectoryHandle } | { kind: 'blob' };
 
 interface ArtifactExportResponse {
   task_uuid: string;
@@ -88,6 +95,7 @@ interface ArtifactExportResponse {
 
 interface ExportSinkResult {
   downloadUrl?: string;
+  filename?: string;
   savedDirectly: boolean;
 }
 
@@ -203,62 +211,99 @@ const getExportMimeType = (exportType: string): string =>
     ? 'text/csv;charset=utf-8'
     : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
-const getPickerMimeType = (exportType: string): string =>
-  exportType === 'csv'
-    ? 'text/csv'
-    : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-
 const prepareExportTarget = async (
-  filename: string | undefined,
-  exportType: 'csv' | 'xlsx',
+  _filename: string | undefined,
+  _exportType: 'csv' | 'xlsx',
 ): Promise<PreparedExportTarget | null> => {
-  const picker = (window as SaveFilePickerWindow).showSaveFilePicker;
+  const picker = (window as DirectoryPickerWindow).showDirectoryPicker;
   if (!picker) {
     return { kind: 'blob' };
   }
 
-  const isZip = filename?.toLowerCase().endsWith('.zip') ?? false;
-  const extension = isZip ? '.zip' : exportType === 'csv' ? '.csv' : '.xlsx';
-  const pickerMimeType = isZip
-    ? 'application/zip'
-    : getPickerMimeType(exportType);
   try {
+    // A directory grant is non-destructive. The concrete file is allocated only
+    // after response headers establish its final CSV/XLSX/ZIP name.
     const handle = await picker.call(window, {
-      suggestedName: filename || `export${extension}`,
-      types: [
-        {
-          description: isZip
-            ? 'ZIP archive'
-            : exportType === 'csv'
-              ? 'CSV file'
-              : 'Excel workbook',
-          accept: { [pickerMimeType]: [extension] },
-        },
-      ],
+      id: 'superset-exports',
+      mode: 'readwrite',
+      startIn: 'downloads',
     });
-    return { kind: 'file-system', handle };
+    return { kind: 'directory', handle };
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') {
       return null;
+    }
+    if (error instanceof DOMException && error.name === 'SecurityError') {
+      return { kind: 'blob' };
     }
     throw error;
   }
 };
 
+const safeExportFilename = (filename: string): string => {
+  const basename = filename.split(/[\\/]/).pop() ?? '';
+  const sanitized = basename.replace(/[\p{Cc}<>:"|?*]/gu, '_').trim();
+  return sanitized && sanitized !== '.' && sanitized !== '..'
+    ? sanitized
+    : 'export';
+};
+
+const filenameWithSuffix = (filename: string, suffix: number): string => {
+  if (suffix === 0) {
+    return filename;
+  }
+  const extensionIndex = filename.lastIndexOf('.');
+  return extensionIndex > 0
+    ? `${filename.slice(0, extensionIndex)} (${suffix})${filename.slice(extensionIndex)}`
+    : `${filename} (${suffix})`;
+};
+
+const createUniqueFileHandle = async (
+  directory: WritableDirectoryHandle,
+  filename: string,
+): Promise<WritableFileHandle> => {
+  const safeFilename = safeExportFilename(filename);
+  for (let suffix = 0; suffix < 1000; suffix += 1) {
+    const candidate = filenameWithSuffix(safeFilename, suffix);
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await directory.getFileHandle(candidate);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'NotFoundError') {
+        // eslint-disable-next-line no-await-in-loop
+        return directory.getFileHandle(candidate, { create: true });
+      }
+      if (error instanceof DOMException && error.name === 'TypeMismatchError') {
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error('Could not allocate a unique export filename');
+};
+
 const createExportSink = async (
   target: PreparedExportTarget,
+  filename: string,
   contentType: string,
   declaredSize: number | undefined,
 ): Promise<ExportSink> => {
-  if (target.kind === 'file-system') {
-    const writable = await target.handle.createWritable();
+  if (target.kind === 'directory') {
+    const fileHandle = await createUniqueFileHandle(target.handle, filename);
+    const writable = await fileHandle.createWritable();
     return {
       write: chunk => writable.write(chunk),
       close: async () => {
         await writable.close();
-        return { savedDirectly: true };
+        return { filename: fileHandle.name, savedDirectly: true };
       },
-      abort: reason => writable.abort(reason),
+      abort: async reason => {
+        try {
+          await writable.abort(reason);
+        } finally {
+          await target.handle.removeEntry(fileHandle.name);
+        }
+      },
     };
   }
 
@@ -475,26 +520,25 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
           throw new Error('Response body is not available for streaming');
         }
 
-        const contentDisposition = response.headers.get('Content-Disposition');
         const defaultFilename = `export.${exportType}`;
-        let serverFilename = defaultFilename;
-
-        if (contentDisposition) {
-          const filenameMatch =
-            contentDisposition.match(/filename="?([^"]+)"?/);
-          if (filenameMatch && filenameMatch[1]) {
-            serverFilename = filenameMatch[1];
-          }
-        }
+        const serverFilename = safeExportFilename(
+          getFilenameFromResponse(response, defaultFilename),
+        );
 
         const reader = response.body.getReader();
         const contentLength = response.headers.get('Content-Length');
         const declaredSize = contentLength
           ? Number.parseInt(contentLength, 10)
           : undefined;
+        const responseContentType =
+          response.headers.get('Content-Type') || getExportMimeType(exportType);
+        const isCsvResponse = responseContentType
+          .toLowerCase()
+          .includes('text/csv');
         sink = await createExportSink(
           target,
-          response.headers.get('Content-Type') || getExportMimeType(exportType),
+          serverFilename,
+          responseContentType,
           Number.isFinite(declaredSize) ? declaredSize : undefined,
         );
         let receivedLength = 0;
@@ -515,7 +559,7 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
             throw new DOMException('Export cancelled by user', 'AbortError');
           }
 
-          if (isSqlLabExport) {
+          if (isSqlLabExport && isCsvResponse) {
             const markerText =
               markerTail + markerDecoder.decode(value, { stream: true });
             const markerIndex = markerText.indexOf(STREAM_ERROR_MARKER);
@@ -537,7 +581,9 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
           // Count newlines using filter (more efficient than loop)
           // Note: This counts all newlines, including those within quoted CSV fields.
           // For an exact row count, server should send row count in response headers.
-          rowsProcessed += countNewlines(value);
+          if (isCsvResponse) {
+            rowsProcessed += countNewlines(value);
+          }
 
           // Update progress based on rows processed
           updateCurrentProgress({
@@ -551,6 +597,7 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
 
         const sinkResult = await sink.close();
         sink = null;
+        const completedFilename = sinkResult.filename || serverFilename;
         if (executionIdRef.current !== executionId) {
           if (sinkResult.downloadUrl) {
             URL.revokeObjectURL(sinkResult.downloadUrl);
@@ -567,15 +614,17 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
         updateCurrentProgress({
           status: ExportStatus.COMPLETED,
           downloadUrl: sinkResult.downloadUrl,
-          filename: serverFilename,
+          filename: completedFilename,
           savedDirectly: sinkResult.savedDirectly,
         });
 
         if (executionIdRef.current === executionId) {
-          options.onComplete?.(sinkResult.downloadUrl, serverFilename);
+          options.onComplete?.(sinkResult.downloadUrl, completedFilename);
         }
       } catch (error) {
-        await sink?.abort(error);
+        if (sink) {
+          await sink.abort(error).catch(() => undefined);
+        }
         if (executionIdRef.current !== executionId) {
           return;
         }

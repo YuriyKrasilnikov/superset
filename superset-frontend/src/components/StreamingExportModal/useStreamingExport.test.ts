@@ -57,6 +57,7 @@ beforeEach(() => {
   SupersetClient.getGuestToken.mockReturnValue(undefined);
   SupersetClient.post.mockResolvedValue({});
   Reflect.deleteProperty(window, 'showSaveFilePicker');
+  Reflect.deleteProperty(window, 'showDirectoryPicker');
 });
 
 test('useStreamingExport initializes with default progress state', () => {
@@ -83,6 +84,23 @@ test('useStreamingExport provides prepareExport function', () => {
   const { result } = renderHook(() => useStreamingExport());
 
   expect(typeof result.current.prepareExport).toBe('function');
+});
+
+test('falls back to a bounded Blob when directory access is unavailable in an iframe', async () => {
+  Object.defineProperty(window, 'showDirectoryPicker', {
+    configurable: true,
+    value: jest.fn(() =>
+      Promise.reject(new DOMException('blocked', 'SecurityError')),
+    ),
+  });
+  const { result } = renderHook(() => useStreamingExport());
+
+  let target: Awaited<ReturnType<typeof result.current.prepareExport>> = null;
+  await act(async () => {
+    target = await result.current.prepareExport('embedded.csv', 'csv');
+  });
+
+  expect(target).toEqual({ kind: 'blob' });
 });
 
 test('useStreamingExport provides resetExport function', () => {
@@ -1291,18 +1309,23 @@ test('state resets correctly after failed export and resetExport call', async ()
   expect(result.current.progress.rowsProcessed).toBe(0);
 });
 
-test('writes directly to a prepared file-system target without creating a Blob URL', async () => {
+test('creates a unique file after a successful response without creating a Blob URL', async () => {
   const write = jest.fn(() => Promise.resolve());
   const close = jest.fn(() => Promise.resolve());
   const abort = jest.fn(() => Promise.resolve());
-  const showSaveFilePicker = jest.fn(() =>
-    Promise.resolve({
-      createWritable: () => Promise.resolve({ write, close, abort }),
-    }),
-  );
-  Object.defineProperty(window, 'showSaveFilePicker', {
+  const fileHandle = {
+    name: 'direct (1).csv',
+    createWritable: () => Promise.resolve({ write, close, abort }),
+  };
+  const getFileHandle = jest
+    .fn()
+    .mockResolvedValueOnce({ name: 'direct.csv' })
+    .mockRejectedValueOnce(new DOMException('missing', 'NotFoundError'))
+    .mockResolvedValueOnce(fileHandle);
+  const showDirectoryPicker = jest.fn(() => Promise.resolve({ getFileHandle }));
+  Object.defineProperty(window, 'showDirectoryPicker', {
     configurable: true,
-    value: showSaveFilePicker,
+    value: showDirectoryPicker,
   });
   const csvData = new TextEncoder().encode('id\n1\n');
   const read = jest
@@ -1328,6 +1351,7 @@ test('writes directly to a prepared file-system target without creating a Blob U
   if (!target) {
     throw new Error('Expected a prepared export target');
   }
+  expect(getFileHandle).not.toHaveBeenCalled();
   const preparedTarget = target;
   act(() => {
     result.current.startExport({
@@ -1346,35 +1370,143 @@ test('writes directly to a prepared file-system target without creating a Blob U
   expect(close).toHaveBeenCalledTimes(1);
   expect(global.URL.createObjectURL).not.toHaveBeenCalled();
   expect(result.current.progress.savedDirectly).toBe(true);
-  expect(onComplete).toHaveBeenCalledWith(undefined, 'direct.csv');
+  expect(onComplete).toHaveBeenCalledWith(undefined, 'direct (1).csv');
+  expect(getFileHandle).toHaveBeenNthCalledWith(1, 'direct.csv');
+  expect(getFileHandle).toHaveBeenNthCalledWith(2, 'direct (1).csv');
+  expect(getFileHandle).toHaveBeenNthCalledWith(3, 'direct (1).csv', {
+    create: true,
+  });
 });
 
-test('prepares a ZIP target for a multi-query CSV export', async () => {
-  const showSaveFilePicker = jest.fn(() =>
-    Promise.resolve({
-      createWritable: jest.fn(),
-    }),
-  );
-  Object.defineProperty(window, 'showSaveFilePicker', {
+test('removes a newly created directory file when response streaming fails', async () => {
+  const write = jest.fn(() => Promise.resolve());
+  const close = jest.fn(() => Promise.resolve());
+  const abort = jest.fn(() => Promise.resolve());
+  const removeEntry = jest.fn(() => Promise.resolve());
+  const fileHandle = {
+    name: 'failed.csv',
+    createWritable: () => Promise.resolve({ write, close, abort }),
+  };
+  const getFileHandle = jest
+    .fn()
+    .mockRejectedValueOnce(new DOMException('missing', 'NotFoundError'))
+    .mockResolvedValueOnce(fileHandle);
+  Object.defineProperty(window, 'showDirectoryPicker', {
     configurable: true,
-    value: showSaveFilePicker,
+    value: jest.fn(() => Promise.resolve({ getFileHandle, removeEntry })),
+  });
+  const read = jest
+    .fn()
+    .mockResolvedValueOnce({
+      done: false,
+      value: new TextEncoder().encode('id\n1\n'),
+    })
+    .mockRejectedValueOnce(new Error('stream disconnected'));
+  global.fetch = jest.fn().mockResolvedValue({
+    ok: true,
+    status: 200,
+    headers: new Headers({
+      'Content-Disposition': 'attachment; filename="failed.csv"',
+      'Content-Type': 'text/csv',
+    }),
+    body: { getReader: () => ({ read }) },
   });
   const { result } = renderHook(() => useStreamingExport());
 
+  let target: Awaited<ReturnType<typeof result.current.prepareExport>> = null;
   await act(async () => {
-    await result.current.prepareExport('multi-query.zip', 'csv');
+    target = await result.current.prepareExport('failed.csv', 'csv');
+  });
+  if (!target) {
+    throw new Error('Expected a prepared export target');
+  }
+  const preparedTarget = target;
+  act(() => {
+    result.current.startExport({
+      url: '/api/v1/chart/data',
+      payload: { datasource: { id: 1, type: 'table' }, queries: [] },
+      exportType: 'csv',
+      exportSource: 'chart',
+      target: preparedTarget,
+    });
   });
 
-  expect(showSaveFilePicker).toHaveBeenCalledWith(
-    expect.objectContaining({
-      suggestedName: 'multi-query.zip',
-      types: [
-        expect.objectContaining({
-          accept: { 'application/zip': ['.zip'] },
-        }),
-      ],
+  await waitFor(() => {
+    expect(result.current.progress.status).toBe(ExportStatus.ERROR);
+  });
+  expect(result.current.progress.error).toBe('stream disconnected');
+  expect(abort).toHaveBeenCalledTimes(1);
+  expect(close).not.toHaveBeenCalled();
+  expect(removeEntry).toHaveBeenCalledWith('failed.csv');
+});
+
+test('uses the server ZIP filename even when the proposed filename was CSV', async () => {
+  const write = jest.fn(() => Promise.resolve());
+  const close = jest.fn(() => Promise.resolve());
+  const abort = jest.fn(() => Promise.resolve());
+  const fileHandle = {
+    name: 'multi-query.zip',
+    createWritable: () => Promise.resolve({ write, close, abort }),
+  };
+  const getFileHandle = jest
+    .fn()
+    .mockRejectedValueOnce(new DOMException('missing', 'NotFoundError'))
+    .mockResolvedValueOnce(fileHandle);
+  const showDirectoryPicker = jest.fn(() => Promise.resolve({ getFileHandle }));
+  Object.defineProperty(window, 'showDirectoryPicker', {
+    configurable: true,
+    value: showDirectoryPicker,
+  });
+  const read = jest
+    .fn()
+    .mockResolvedValueOnce({
+      done: false,
+      value: new TextEncoder().encode('binary-like\nbytes\n'),
+    })
+    .mockResolvedValueOnce({ done: true, value: undefined });
+  global.fetch = jest.fn().mockResolvedValue({
+    ok: true,
+    status: 200,
+    headers: new Headers({
+      'Content-Disposition': 'attachment; filename="multi-query.zip"',
+      'Content-Type': 'application/zip',
     }),
-  );
+    body: { getReader: () => ({ read }) },
+  });
+  const { result } = renderHook(() => useStreamingExport());
+
+  let target: Awaited<ReturnType<typeof result.current.prepareExport>> = null;
+  await act(async () => {
+    target = await result.current.prepareExport('stale-name.csv', 'csv');
+  });
+  if (!target) {
+    throw new Error('Expected a prepared export target');
+  }
+  const preparedTarget = target;
+  act(() => {
+    result.current.startExport({
+      url: '/api/v1/chart/data',
+      payload: { datasource: { id: 1, type: 'table' }, queries: [] },
+      exportType: 'csv',
+      exportSource: 'chart',
+      target: preparedTarget,
+    });
+  });
+
+  await waitFor(() => {
+    expect(result.current.progress.status).toBe(ExportStatus.COMPLETED);
+  });
+  expect(showDirectoryPicker).toHaveBeenCalledWith({
+    id: 'superset-exports',
+    mode: 'readwrite',
+    startIn: 'downloads',
+  });
+  expect(getFileHandle).toHaveBeenNthCalledWith(1, 'multi-query.zip');
+  expect(getFileHandle).toHaveBeenNthCalledWith(2, 'multi-query.zip', {
+    create: true,
+  });
+  expect(result.current.progress.filename).toBe('multi-query.zip');
+  expect(result.current.progress.rowsProcessed).toBe(0);
 });
 
 test('polls an accepted artifact task and streams its download into the prepared sink', async () => {
