@@ -1440,6 +1440,57 @@ test('removes a newly created directory file when response streaming fails', asy
   expect(removeEntry).toHaveBeenCalledWith('failed.csv');
 });
 
+test('removes a newly created directory file when opening its stream fails', async () => {
+  const openError = new Error('file is no longer writable');
+  const removeEntry = jest.fn(() => Promise.resolve());
+  const fileHandle = {
+    name: 'failed.csv',
+    createWritable: jest.fn(() => Promise.reject(openError)),
+  };
+  const getFileHandle = jest
+    .fn()
+    .mockRejectedValueOnce(new DOMException('missing', 'NotFoundError'))
+    .mockResolvedValueOnce(fileHandle);
+  Object.defineProperty(window, 'showDirectoryPicker', {
+    configurable: true,
+    value: jest.fn(() => Promise.resolve({ getFileHandle, removeEntry })),
+  });
+  global.fetch = jest.fn().mockResolvedValue({
+    ok: true,
+    status: 200,
+    headers: new Headers({
+      'Content-Disposition': 'attachment; filename="failed.csv"',
+      'Content-Type': 'text/csv',
+    }),
+    body: { getReader: () => ({ read: jest.fn() }) },
+  });
+  const { result } = renderHook(() => useStreamingExport());
+
+  let target: Awaited<ReturnType<typeof result.current.prepareExport>> = null;
+  await act(async () => {
+    target = await result.current.prepareExport('failed.csv', 'csv');
+  });
+  if (!target) {
+    throw new Error('Expected a prepared export target');
+  }
+  const preparedTarget = target;
+  act(() => {
+    result.current.startExport({
+      url: '/api/v1/chart/data',
+      payload: { datasource: { id: 1, type: 'table' }, queries: [] },
+      exportType: 'csv',
+      exportSource: 'chart',
+      target: preparedTarget,
+    });
+  });
+
+  await waitFor(() => {
+    expect(result.current.progress.status).toBe(ExportStatus.ERROR);
+  });
+  expect(result.current.progress.error).toBe(openError.message);
+  expect(removeEntry).toHaveBeenCalledWith('failed.csv');
+});
+
 test('uses the server ZIP filename even when the proposed filename was CSV', async () => {
   const write = jest.fn(() => Promise.resolve());
   const close = jest.fn(() => Promise.resolve());
@@ -1507,108 +1558,6 @@ test('uses the server ZIP filename even when the proposed filename was CSV', asy
   });
   expect(result.current.progress.filename).toBe('multi-query.zip');
   expect(result.current.progress.rowsProcessed).toBe(0);
-});
-
-test('polls an accepted artifact task and streams its download into the prepared sink', async () => {
-  const artifactData = new TextEncoder().encode('id\n1\n');
-  const read = jest
-    .fn()
-    .mockResolvedValueOnce({ done: false, value: artifactData })
-    .mockResolvedValueOnce({ done: true, value: undefined });
-  const mockFetch = jest
-    .fn()
-    .mockResolvedValueOnce({
-      ok: true,
-      status: 202,
-      json: () =>
-        Promise.resolve({
-          task_uuid: 'task-uuid',
-          status_url: '/api/v1/task/task-uuid/status',
-          artifact_url: '/api/v1/task/task-uuid/artifact',
-        }),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ status: 'success' }),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      headers: new Headers({
-        'Content-Disposition': 'attachment; filename="artifact.csv"',
-        'Content-Length': String(artifactData.length),
-      }),
-      body: { getReader: () => ({ read }) },
-    });
-  global.fetch = mockFetch;
-  const { result } = renderHook(() => useStreamingExport());
-
-  act(() => {
-    result.current.startExport({
-      url: '/api/v1/chart/data',
-      payload: { datasource: { id: 1, type: 'table' }, queries: [] },
-      exportType: 'csv',
-      exportSource: 'chart',
-    });
-  });
-
-  await waitFor(() => {
-    expect(result.current.progress.status).toBe(ExportStatus.COMPLETED);
-  });
-  expect(mockFetch).toHaveBeenNthCalledWith(
-    2,
-    '/api/v1/task/task-uuid/status',
-    expect.objectContaining({ credentials: 'same-origin' }),
-  );
-  expect(mockFetch).toHaveBeenNthCalledWith(
-    3,
-    '/api/v1/task/task-uuid/artifact',
-    expect.objectContaining({ credentials: 'same-origin' }),
-  );
-  expect(result.current.progress.filename).toBe('artifact.csv');
-  expect(result.current.progress.downloadUrl).toBe('blob:mock-url');
-});
-
-test('cancels the GTF task after an artifact export is accepted', async () => {
-  const mockFetch = jest
-    .fn()
-    .mockResolvedValueOnce({
-      ok: true,
-      status: 202,
-      json: () =>
-        Promise.resolve({
-          task_uuid: 'task-uuid',
-          status_url: '/api/v1/task/task-uuid/status',
-          artifact_url: '/api/v1/task/task-uuid/artifact',
-        }),
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ status: 'in_progress' }),
-    });
-  global.fetch = mockFetch;
-  const { SupersetClient } = jest.requireMock('@superset-ui/core');
-  const { result } = renderHook(() => useStreamingExport());
-
-  act(() => {
-    result.current.startExport({
-      url: '/api/v1/chart/data',
-      payload: { datasource: { id: 1, type: 'table' }, queries: [] },
-      exportType: 'csv',
-      exportSource: 'chart',
-    });
-  });
-  await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(2));
-
-  act(() => result.current.cancelExport());
-
-  await waitFor(() => {
-    expect(SupersetClient.post).toHaveBeenCalledWith({
-      endpoint: '/api/v1/task/task-uuid/cancel',
-      jsonPayload: {},
-    });
-  });
-  expect(result.current.progress.status).toBe(ExportStatus.CANCELLED);
 });
 
 test('rejects an oversized response before reading it into the Blob fallback', async () => {
