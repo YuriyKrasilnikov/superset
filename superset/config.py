@@ -800,6 +800,9 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     # Global Task Framework - unified task management with progress tracking,
     # cancellation, and deduplication.
     "GLOBAL_TASK_FRAMEWORK": False,
+    # Generate non-direct large chart exports through private GTF artifacts.
+    # Requires GLOBAL_TASK_FRAMEWORK and CHART_DATA_ARTIFACT_STORE.
+    "CHART_DATA_ASYNC_EXPORTS": False,
     # Use analogous colors in charts
     # @lifecycle: testing
     "USE_ANALOGOUS_COLORS": False,
@@ -1444,6 +1447,11 @@ CSV_EXPORT = {"encoding": "utf-8-sig"}
 # large datasets efficiently.
 CSV_STREAMING_ROW_THRESHOLD = 100000
 
+# Durable store used by CHART_DATA_ASYNC_EXPORTS. The object must implement
+# superset.charts.data.artifacts.ChartDataArtifactStore.
+CHART_DATA_ARTIFACT_STORE: Any | None = None
+CHART_DATA_ARTIFACT_TTL_SECONDS = 24 * 60 * 60
+
 # Excel Options: key/value pairs that will be passed as argument to DataFrame.to_excel
 # method.
 # note: index option should not be overridden
@@ -1677,6 +1685,13 @@ class CeleryConfig:  # pylint: disable=too-few-public-methods
         #     "task": "prune_tasks",
         #     "schedule": crontab(minute=0, hour=0),
         #     "kwargs": {"retention_period_days": 90, "max_rows_per_run": 10000},
+        # },
+        # Remove expired chart export artifacts when CHART_DATA_ASYNC_EXPORTS is
+        # enabled. This schedule should run more frequently than the artifact TTL.
+        # "prune_chart_data_export_artifacts": {
+        #     "task": "prune_chart_data_export_artifacts",
+        #     "schedule": crontab(minute=0, hour="*"),
+        #     "kwargs": {"max_rows_per_run": 10000},
         # },
         # Uncomment to enable pruning of expired entries from the key-value store
         # (for example, rows left behind by the metastore cache backend)

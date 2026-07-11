@@ -100,8 +100,39 @@ class TaskPruneCommand(BaseCommand):
         for i in range(0, total_rows, batch_size):
             batch_ids = ids_to_delete[i : i + batch_size]
 
+            # Storage objects are not covered by the database FK cascade. Keep
+            # tasks whose artifacts cannot be removed so their storage keys
+            # remain addressable for a later cleanup attempt.
+            from superset.charts.data.artifacts import (
+                get_chart_data_artifact_store,
+            )
+            from superset.daos.chart_data_export_artifact import (
+                ChartDataExportArtifactDAO,
+            )
+
+            blocked_task_ids: set[int] = set()
+            for artifact in ChartDataExportArtifactDAO.find_by_task_ids(batch_ids):
+                try:
+                    get_chart_data_artifact_store().delete(artifact.storage_key)
+                except Exception:  # pylint: disable=broad-except
+                    blocked_task_ids.add(artifact.task_id)
+                    logger.exception(
+                        "Keeping task %s because export artifact %s could not be "
+                        "removed",
+                        artifact.task_id,
+                        artifact.uuid,
+                    )
+
+            deletable_ids = [
+                task_id for task_id in batch_ids if task_id not in blocked_task_ids
+            ]
+            if not deletable_ids:
+                continue
+
             # Delete the selected batch using IN clause
-            result = db.session.execute(sa.delete(Task).where(Task.id.in_(batch_ids)))
+            result = db.session.execute(
+                sa.delete(Task).where(Task.id.in_(deletable_ids))
+            )
 
             # Update the total number of deleted records
             total_deleted += result.rowcount

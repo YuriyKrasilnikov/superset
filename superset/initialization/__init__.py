@@ -1356,6 +1356,26 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
 
     def configure_task_manager(self) -> None:
         """Initialize the TaskManager for GTF realtime notifications."""
+        if feature_flag_manager.is_feature_enabled("CHART_DATA_ASYNC_EXPORTS"):
+            if not feature_flag_manager.is_feature_enabled("GLOBAL_TASK_FRAMEWORK"):
+                raise RuntimeError(
+                    "CHART_DATA_ASYNC_EXPORTS requires GLOBAL_TASK_FRAMEWORK"
+                )
+            from superset.charts.data.artifacts import (
+                get_chart_data_artifact_store,
+            )
+            from superset.tasks import chart_data_exports  # noqa: F401
+
+            get_chart_data_artifact_store()
+            artifact_ttl = self.config["CHART_DATA_ARTIFACT_TTL_SECONDS"]
+            if (
+                isinstance(artifact_ttl, bool)
+                or not isinstance(artifact_ttl, int)
+                or artifact_ttl <= 0
+            ):
+                raise RuntimeError(
+                    "CHART_DATA_ARTIFACT_TTL_SECONDS must be a positive integer"
+                )
         if feature_flag_manager.is_feature_enabled("GLOBAL_TASK_FRAMEWORK"):
             from superset.tasks.manager import TaskManager
 
