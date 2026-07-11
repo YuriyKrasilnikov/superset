@@ -1826,6 +1826,15 @@ def test_post_process_df_non_zero_based_index() -> None:
     assert result["col"].iloc[1] == "[3, 4]"
 
 
+def test_post_process_df_detects_nested_values_after_nulls() -> None:
+    """Leading nulls do not hide a nested database column from normalization."""
+    df = pd.DataFrame({"col": [None, {"answer": 42}]}, dtype=object)
+
+    result = Database.post_process_df(df)
+
+    assert result["col"].tolist() == ["null", '{"answer": 42}']
+
+
 class _DispatchParkHarness:
     """Coordination for parking one thread mid connect-event dispatch.
 

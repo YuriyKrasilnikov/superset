@@ -763,11 +763,14 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
     @staticmethod
     def post_process_df(df: pd.DataFrame) -> pd.DataFrame:
         def column_needs_conversion(df_series: pd.Series) -> bool:
-            return (
-                not df_series.empty
-                and isinstance(df_series, pd.Series)
-                and isinstance(df_series.iloc[0], (list, dict))
-            )
+            for value in df_series:
+                if isinstance(value, (list, dict)):
+                    return True
+                missing = pd.isna(value)
+                if isinstance(missing, (bool, numpy.bool_)) and missing:
+                    continue
+                return False
+            return False
 
         for col, coltype in df.dtypes.to_dict().items():
             if coltype == numpy.object_ and column_needs_conversion(df[col]):
