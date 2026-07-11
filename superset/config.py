@@ -1450,6 +1450,8 @@ CSV_STREAMING_ROW_THRESHOLD = 100000
 # Durable store used by CHART_DATA_ASYNC_EXPORTS. The object must implement
 # superset.charts.data.artifacts.ChartDataArtifactStore.
 CHART_DATA_ARTIFACT_STORE: Any | None = None
+# Maximum lifetime of an incomplete artifact tombstone. A completed artifact
+# receives a fresh interval of the same length after its object is durable.
 CHART_DATA_ARTIFACT_TTL_SECONDS = 24 * 60 * 60
 
 # Excel Options: key/value pairs that will be passed as argument to DataFrame.to_excel

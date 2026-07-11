@@ -49,6 +49,7 @@ from superset.utils.decorators import transaction
 
 _WRITE_CHUNK_SIZE = 1024 * 1024
 _MAX_ARTIFACT_FILENAME_LENGTH = 255
+_INCOMPLETE_ARTIFACT_CONTENT_TYPE = "application/octet-stream"
 
 
 def _query_context_payload(query_context: Any) -> dict[str, Any]:
@@ -114,6 +115,20 @@ def _tracked_chunks(
         yield chunk
 
 
+def _artifact_expiration() -> datetime:
+    """Return the cleanup deadline for the artifact's current lifecycle phase."""
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+        seconds=current_app.config["CHART_DATA_ARTIFACT_TTL_SECONDS"]
+    )
+
+
+def _artifact_filename(filename: str, extension: str) -> str:
+    """Return a safe filename bounded by the metadata column width."""
+    filename_stem = secure_filename(Path(filename).stem) or "export"
+    filename_stem = filename_stem[: _MAX_ARTIFACT_FILENAME_LENGTH - len(extension)]
+    return f"{filename_stem}{extension}"
+
+
 @transaction()
 def _create_artifact_tombstone(artifact: ChartDataExportArtifact) -> None:
     """Commit the cleanup key before external object storage is mutated."""
@@ -125,10 +140,16 @@ def _finalize_artifact_metadata(
     artifact: ChartDataExportArtifact,
     size: int,
     sha256: str,
+    filename: str,
+    content_type: str,
+    expires_at: datetime,
 ) -> None:
     """Commit metadata only after the artifact object is durable."""
     artifact.size_bytes = size
     artifact.sha256 = sha256
+    artifact.filename = filename
+    artifact.content_type = content_type
+    artifact.expires_at = expires_at
 
 
 @task(name="chart_data.generate_export_artifact", scope=TaskScope.PRIVATE)
@@ -168,39 +189,42 @@ def generate_chart_data_export_artifact(
         else:
             store.delete(storage_key)
 
-    with override_user(user):
-        content, content_type = _materialize_export(payload)
-    if aborted.is_set():
-        raise RuntimeError("Chart-data export was cancelled")
-
     datasource = payload["datasource"]
-    extension = ".zip" if content_type == "application/zip" else ".csv"
-    filename_stem = secure_filename(Path(filename).stem) or "export"
-    filename_stem = filename_stem[: _MAX_ARTIFACT_FILENAME_LENGTH - len(extension)]
-    artifact_filename = f"{filename_stem}{extension}"
-    expires_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
-        seconds=current_app.config["CHART_DATA_ARTIFACT_TTL_SECONDS"]
-    )
     artifact = ChartDataExportArtifact(
         task_id=task_record.id,
         owner_id=owner_id,
         datasource_id=str(datasource["id"]),
         datasource_type=str(datasource["type"]),
         storage_key=storage_key,
-        filename=artifact_filename,
-        content_type=content_type,
+        filename=_artifact_filename(filename, ".csv"),
+        content_type=_INCOMPLETE_ARTIFACT_CONTENT_TYPE,
         size_bytes=0,
         sha256="",
-        expires_at=expires_at,
+        expires_at=_artifact_expiration(),
     )
     with override_user(user):
         _create_artifact_tombstone(artifact)
 
+    with override_user(user):
+        content, content_type = _materialize_export(payload)
+    if aborted.is_set():
+        raise RuntimeError("Chart-data export was cancelled")
+
+    extension = ".zip" if content_type == "application/zip" else ".csv"
+    artifact_filename = _artifact_filename(filename, extension)
     digest = hashlib.sha256()
     size = store.write(storage_key, _tracked_chunks(content, digest, aborted))
     if aborted.is_set():
         raise RuntimeError("Chart-data export was cancelled")
-    _finalize_artifact_metadata(artifact, size, digest.hexdigest())
+    expires_at = _artifact_expiration()
+    _finalize_artifact_metadata(
+        artifact,
+        size,
+        digest.hexdigest(),
+        artifact_filename,
+        content_type,
+        expires_at,
+    )
     context.update_task(
         progress=1.0,
         payload={

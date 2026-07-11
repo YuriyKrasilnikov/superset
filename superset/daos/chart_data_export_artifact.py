@@ -16,12 +16,19 @@
 # under the License.
 """DAO for chart-data export artifact metadata."""
 
+from __future__ import annotations
+
 from datetime import datetime
-from typing import Sequence
+from typing import Sequence, TYPE_CHECKING
 from uuid import UUID
+
+from superset_core.tasks.types import TaskStatus
 
 from superset.daos.base import BaseDAO
 from superset.models.chart_data_export_artifact import ChartDataExportArtifact
+
+if TYPE_CHECKING:
+    from superset.models.tasks import Task
 
 
 class ChartDataExportArtifactDAO(BaseDAO[ChartDataExportArtifact]):
@@ -58,6 +65,39 @@ class ChartDataExportArtifactDAO(BaseDAO[ChartDataExportArtifact]):
                 ChartDataExportArtifact.expires_at.asc(),
                 ChartDataExportArtifact.id.asc(),
             )
+        )
+        if max_rows is not None and max_rows > 0:
+            query = query.limit(max_rows)
+        return query.all()
+
+    @classmethod
+    def find_stale_tasks_without_artifacts(
+        cls,
+        started_before: datetime,
+        max_rows: int | None = None,
+    ) -> list[Task]:
+        """Find active export tasks that never persisted a cleanup tombstone."""
+        from superset import db
+        from superset.models.tasks import Task
+
+        query = (
+            db.session.query(Task)
+            .outerjoin(
+                ChartDataExportArtifact,
+                ChartDataExportArtifact.task_id == Task.id,
+            )
+            .filter(
+                Task.task_type == "chart_data.generate_export_artifact",
+                Task.status.in_(
+                    [
+                        TaskStatus.IN_PROGRESS.value,
+                        TaskStatus.ABORTING.value,
+                    ]
+                ),
+                Task.started_at <= started_before,
+                ChartDataExportArtifact.id.is_(None),
+            )
+            .order_by(Task.started_at.asc(), Task.id.asc())
         )
         if max_rows is not None and max_rows > 0:
             query = query.limit(max_rows)
