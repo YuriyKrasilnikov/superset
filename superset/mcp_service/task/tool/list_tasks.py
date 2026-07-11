@@ -66,7 +66,8 @@ async def list_tasks(
     Search columns (via search=): task_type, task_key, task_name, status, scope
 
     Common task_type values: sql_execution, thumbnail, report
-    Common status values: pending, in_progress, success, failure, aborted
+    Common status values: pending, in_progress, finalizing, aborting, success,
+    failure, aborted, timed_out
     Common scope values: private, shared, system
     """
     if ctx is None:

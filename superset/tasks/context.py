@@ -30,7 +30,7 @@ from superset_core.tasks.types import (
     TaskStatus,
 )
 
-from superset.stats_logger import BaseStatsLogger
+from superset.stats_logger import BaseStatsLogger, DummyStatsLogger
 from superset.tasks.constants import ABORT_STATES
 from superset.tasks.utils import progress_update
 
@@ -39,6 +39,9 @@ if TYPE_CHECKING:
     from superset.tasks.manager import AbortListener
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_ABORT_POLLING_INTERVAL = 10
+_DEFAULT_PROGRESS_UPDATE_THROTTLE_INTERVAL = 2
 
 T = TypeVar("T")
 
@@ -65,12 +68,19 @@ class TaskContext(CoreTaskContext):
         :param task: Pre-fetched Task entity (required)
         """
         self._task_uuid = task.uuid
+        self._finalize_handlers: list[Callable[[], None]] = []
         self._cleanup_handlers: list[Callable[[], None]] = []
         self._abort_handlers: list[Callable[[], None]] = []
         self._abort_listener: "AbortListener | None" = None
         self._abort_detected = False
         self._abort_handlers_completed = False  # Track if all abort handlers finished
         self._execution_completed = False  # Set by executor after task work completes
+        self._execution_failed = False
+        self._handler_failure_detected = False
+
+        # Serializes the boundary between task completion and asynchronous
+        # abort/timeout callbacks. An RLock lets handlers update their own context.
+        self._lifecycle_lock = threading.RLock()
 
         # Collected handler failures for unified reporting
         self._handler_failures: list[TaskContext.HandlerFailure] = []
@@ -98,19 +108,33 @@ class TaskContext(CoreTaskContext):
             TaskProperties, {**task.properties_dict}
         )
         self._payload_cache: dict[str, Any] = {**task.payload_dict}
+        self._abort_polling_interval: float
+        self._progress_update_throttle_interval: float
 
         # Store Flask app reference for background thread database access
         # Use _get_current_object() to get actual app, not proxy
         try:
             self._app = current_app._get_current_object()
+            self._abort_polling_interval = current_app.config.get(
+                "TASK_ABORT_POLLING_DEFAULT_INTERVAL",
+                _DEFAULT_ABORT_POLLING_INTERVAL,
+            )
+            self._progress_update_throttle_interval = current_app.config.get(
+                "TASK_PROGRESS_UPDATE_THROTTLE_INTERVAL",
+                _DEFAULT_PROGRESS_UPDATE_THROTTLE_INTERVAL,
+            )
             # Cache stats logger to avoid repeated config lookups
             self._stats_logger: BaseStatsLogger = current_app.config.get(
-                "STATS_LOGGER", BaseStatsLogger()
+                "STATS_LOGGER", DummyStatsLogger()
             )
         except RuntimeError:
             # Handle case where app context isn't available (e.g., tests)
             self._app = None
-            self._stats_logger = BaseStatsLogger()
+            self._abort_polling_interval = _DEFAULT_ABORT_POLLING_INTERVAL
+            self._progress_update_throttle_interval = (
+                _DEFAULT_PROGRESS_UPDATE_THROTTLE_INTERVAL
+            )
+            self._stats_logger = DummyStatsLogger()
 
     def _refresh_task(self) -> "Task":
         """
@@ -133,11 +157,14 @@ class TaskContext(CoreTaskContext):
         if not fresh_task:
             raise ValueError(f"Task {self._task_uuid} not found")
 
-        self._task = fresh_task
+        with self._lifecycle_lock:
+            self._task = fresh_task
 
-        # Update caches from fresh data (copy to avoid mutating Task's cache)
-        self._properties_cache = cast(TaskProperties, {**fresh_task.properties_dict})
-        self._payload_cache = {**fresh_task.payload_dict}
+            # Update caches from fresh data (copy to avoid mutating Task's cache)
+            self._properties_cache = cast(
+                TaskProperties, {**fresh_task.properties_dict}
+            )
+            self._payload_cache = {**fresh_task.payload_dict}
 
         return self._task
 
@@ -164,34 +191,33 @@ class TaskContext(CoreTaskContext):
         :param payload: Payload data to merge (dict), or None to leave unchanged
         """
         has_updates = False
+        with self._lifecycle_lock:
+            # Handle progress updates - always update in-memory cache
+            if progress is not None:
+                progress_props = progress_update(progress)
+                if progress_props:
+                    # Merge progress into cached properties
+                    self._properties_cache.update(progress_props)
+                    has_updates = True
+                else:
+                    # Invalid progress format - progress_update returns empty dict
+                    logger.warning(
+                        "Invalid progress value for task %s: %s "
+                        "(expected float, int, or tuple[int, int])",
+                        self._task_uuid,
+                        progress,
+                    )
 
-        # Handle progress updates - always update in-memory cache
-        if progress is not None:
-            progress_props = progress_update(progress)
-            if progress_props:
-                # Merge progress into cached properties
-                self._properties_cache.update(progress_props)
+            # Handle payload updates - always update in-memory cache
+            if payload is not None:
+                # Merge payload into cached payload
+                self._payload_cache.update(payload)
                 has_updates = True
-            else:
-                # Invalid progress format - progress_update returns empty dict
-                logger.warning(
-                    "Invalid progress value for task %s: %s "
-                    "(expected float, int, or tuple[int, int])",
-                    self._task_uuid,
-                    progress,
-                )
-
-        # Handle payload updates - always update in-memory cache
-        if payload is not None:
-            # Merge payload into cached payload
-            self._payload_cache.update(payload)
-            has_updates = True
 
         if not has_updates:
             return
 
-        # Get throttle interval from config
-        throttle_interval = current_app.config["TASK_PROGRESS_UPDATE_THROTTLE_INTERVAL"]
+        throttle_interval = self._progress_update_throttle_interval
 
         # If throttling is disabled (0), write immediately
         if throttle_interval <= 0:
@@ -228,6 +254,33 @@ class TaskContext(CoreTaskContext):
                     self._deferred_flush_timer.daemon = True
                     self._deferred_flush_timer.start()
 
+    def capture_execution_failure(self, error: Exception) -> TaskProperties:
+        """Record an execution error and return the complete properties snapshot."""
+        with self._lifecycle_lock:
+            self._execution_failed = True
+            self._properties_cache.update(
+                {
+                    "error_message": str(error),
+                    "exception_type": type(error).__name__,
+                }
+            )
+            return cast(TaskProperties, {**self._properties_cache})
+
+    def properties_snapshot(self) -> TaskProperties:
+        """Return the complete authoritative task properties snapshot."""
+        with self._lifecycle_lock:
+            return cast(TaskProperties, {**self._properties_cache})
+
+    @property
+    def can_finalize(self) -> bool:
+        """Return whether success-only publication may still run."""
+        with self._lifecycle_lock:
+            return not (
+                self._execution_failed
+                or self._abort_detected
+                or self._timeout_triggered
+            )
+
     def _write_to_db(self) -> None:
         """
         Write current cached state to database.
@@ -239,10 +292,14 @@ class TaskContext(CoreTaskContext):
 
         self._stats_logger.incr("gtf.task.update_write")
 
+        with self._lifecycle_lock:
+            properties = cast(TaskProperties, {**self._properties_cache})
+            payload = {**self._payload_cache}
+
         InternalUpdateTaskCommand(
             task_uuid=self._task_uuid,
-            properties=self._properties_cache,
-            payload=self._payload_cache,
+            properties=properties,
+            payload=payload,
         ).run()
 
     def _deferred_flush(self) -> None:
@@ -294,6 +351,11 @@ class TaskContext(CoreTaskContext):
         self._cleanup_handlers.append(handler)
         return handler
 
+    def on_finalize(self, handler: Callable[[], None]) -> Callable[[], None]:
+        """Register a success-only handler for fenced result publication."""
+        self._finalize_handlers.append(handler)
+        return handler
+
     def on_abort(self, handler: Callable[[], None]) -> Callable[[], None]:
         """
         Register abort handler with automatic background listening.
@@ -318,16 +380,16 @@ class TaskContext(CoreTaskContext):
             The task code continues running unless the handler does something
             to stop it (e.g., raises an exception, modifies shared state, etc.)
         """
-        is_first_handler = len(self._abort_handlers) == 0
-        self._abort_handlers.append(handler)
+        with self._lifecycle_lock:
+            is_first_handler = len(self._abort_handlers) == 0
+            self._abort_handlers.append(handler)
 
         if is_first_handler:
             # Mark task as abortable in database
             self._set_abortable()
 
             # Auto-start abort listener when first handler is registered
-            interval = current_app.config["TASK_ABORT_POLLING_DEFAULT_INTERVAL"]
-            self._start_abort_listener(interval)
+            self._start_abort_listener(self._abort_polling_interval)
 
         return handler
 
@@ -335,11 +397,13 @@ class TaskContext(CoreTaskContext):
         """Mark the task as abortable (abort handler has been registered)."""
         from superset.commands.tasks.internal_update import InternalUpdateTaskCommand
 
-        # Update local cache and write to DB
-        self._properties_cache["is_abortable"] = True
+        # Update local cache and write its complete authoritative snapshot.
+        with self._lifecycle_lock:
+            self._properties_cache["is_abortable"] = True
+            properties = cast(TaskProperties, {**self._properties_cache})
         InternalUpdateTaskCommand(
             task_uuid=self._task_uuid,
-            properties=self._properties_cache,
+            properties=properties,
         ).run()
 
     def _start_abort_listener(self, interval: float) -> None:
@@ -367,21 +431,22 @@ class TaskContext(CoreTaskContext):
 
         Triggers all registered abort handlers.
         """
-        if self._abort_detected:
-            return  # Already handled
+        with self._lifecycle_lock:
+            if self._abort_detected:
+                return  # Already handled
 
-        # Check if task execution has already completed (late abort race).
-        # Executor sets _execution_completed after task work finishes.
-        if self._execution_completed:
-            logger.info(
-                "Abort detected for task %s but execution already completed",
-                self._task_uuid,
-            )
-            return
+            # The same lock guards mark_execution_completed(), making the decision
+            # and handler execution atomic with respect to task finalization.
+            if self._execution_completed:
+                logger.info(
+                    "Abort detected for task %s but execution already completed",
+                    self._task_uuid,
+                )
+                return
 
-        self._abort_detected = True
-        logger.info("Abort detected for task %s", self._task_uuid)
-        self._trigger_abort_handlers()
+            self._abort_detected = True
+            logger.info("Abort detected for task %s", self._task_uuid)
+            self._trigger_abort_handlers()
 
     def mark_execution_completed(self) -> None:
         """
@@ -392,7 +457,12 @@ class TaskContext(CoreTaskContext):
         handlers when the task work has already finished. Cleanup handlers
         still run after this is set.
         """
-        self._execution_completed = True
+        with self._lifecycle_lock:
+            self._execution_completed = True
+
+    def detect_abort_before_finalization(self) -> None:
+        """Synchronously observe an abort that won the finalization CAS."""
+        self._on_abort_detected()
 
     def start_abort_polling(self, interval: float | None = None) -> None:
         """
@@ -404,7 +474,7 @@ class TaskContext(CoreTaskContext):
         :param interval: Polling interval in seconds (uses config default if None)
         """
         if interval is None:
-            interval = current_app.config["TASK_ABORT_POLLING_DEFAULT_INTERVAL"]
+            interval = self._abort_polling_interval
         self._start_abort_listener(interval)
 
     def _trigger_abort_handlers(self) -> None:
@@ -414,38 +484,39 @@ class TaskContext(CoreTaskContext):
         All handlers are attempted even if some fail (best-effort cleanup).
         Failures are collected in self._handler_failures for unified reporting.
 
-        Note: This method never writes to DB directly. All failures are collected
-        and written by _run_cleanup() in the executor's finally block, ensuring
-        abort and cleanup handler failures are combined into a single record.
+        This method never writes to the database. Cleanup combines all handler
+        failures into the executor's single terminal transition.
         """
-        for handler in reversed(self._abort_handlers):
-            try:
-                handler()
-            except Exception as ex:
-                stack_trace = traceback.format_exc()
-                logger.error(
-                    "Abort handler failed for task %s: %s",
-                    self._task_uuid,
-                    str(ex),
-                    exc_info=True,
-                )
-                self._handler_failures.append(("abort", ex, stack_trace))
+        with self._lifecycle_lock:
+            for handler in reversed(self._abort_handlers):
+                try:
+                    handler()
+                except Exception as ex:
+                    stack_trace = traceback.format_exc()
+                    logger.error(
+                        "Abort handler failed for task %s: %s",
+                        self._task_uuid,
+                        str(ex),
+                        exc_info=True,
+                    )
+                    self._handler_failures.append(("abort", ex, stack_trace))
 
-        # Check if all abort handlers completed successfully
-        abort_failures = [f for f in self._handler_failures if f[0] == "abort"]
-        if not abort_failures:
-            self._abort_handlers_completed = True
+            # Check if all abort handlers completed successfully
+            abort_failures = [f for f in self._handler_failures if f[0] == "abort"]
+            if not abort_failures:
+                self._abort_handlers_completed = True
 
-    def _write_handler_failures_to_db(self) -> None:
+    def _capture_handler_failures(self) -> None:
         """
-        Write collected handler failures to the database.
+        Merge collected handler failures into the authoritative properties cache.
 
         Combines all failures (abort + cleanup) into a single error record.
         If the task already has an error (e.g., task function threw exception),
         handler failures are APPENDED to preserve the original error context.
-        """
-        from superset.commands.tasks.update import UpdateTaskCommand
 
+        The executor persists these properties atomically with the single terminal
+        status transition after all cleanup has completed.
+        """
         if not self._handler_failures:
             return
 
@@ -475,49 +546,39 @@ class TaskContext(CoreTaskContext):
                 for htype, ex, trace in self._handler_failures
             )
 
-        if self._app:
-            with self._app.app_context():
-                # Check if task already has an error (preserve original context)
-                task = self._task
-                original_error = task.properties_dict.get("error_message")
-                original_type = task.properties_dict.get("exception_type")
-                original_trace = task.properties_dict.get("stack_trace")
+        with self._lifecycle_lock:
+            original_error = self._properties_cache.get("error_message")
+            original_type = self._properties_cache.get("exception_type")
+            original_trace = self._properties_cache.get("stack_trace")
 
-                if original_error:
-                    # Append handler failures to original error
-                    error_msg = f"{original_error} | {handler_error_msg}"
-                    exception_type = (
-                        f"{original_type}+{handler_exception_type}"
-                        if original_type
-                        else handler_exception_type
-                    )
-                    stack_trace = (
-                        f"{original_trace}\n\n"
-                        f"=== Handler failures during cleanup ===\n\n"
-                        f"{handler_stack_trace}"
-                        if original_trace
-                        else handler_stack_trace
-                    )
-                else:
-                    # No original error, just use handler failures
-                    error_msg = handler_error_msg
-                    exception_type = handler_exception_type
-                    stack_trace = handler_stack_trace
+            if original_error:
+                error_msg = f"{original_error} | {handler_error_msg}"
+                exception_type = (
+                    f"{original_type}+{handler_exception_type}"
+                    if original_type
+                    else handler_exception_type
+                )
+                stack_trace = (
+                    f"{original_trace}\n\n"
+                    f"=== Handler failures during cleanup ===\n\n"
+                    f"{handler_stack_trace}"
+                    if original_trace
+                    else handler_stack_trace
+                )
+            else:
+                error_msg = handler_error_msg
+                exception_type = handler_exception_type
+                stack_trace = handler_stack_trace
 
-                # Update task with combined error info
-                UpdateTaskCommand(
-                    self._task_uuid,
-                    status=TaskStatus.FAILURE.value,
-                    properties={
-                        "error_message": error_msg,
-                        "exception_type": exception_type,
-                        "stack_trace": stack_trace,
-                    },
-                    skip_security_check=True,
-                ).run()
-
-        # Clear failures after writing
-        self._handler_failures = []
+            self._properties_cache.update(
+                {
+                    "error_message": error_msg,
+                    "exception_type": exception_type,
+                    "stack_trace": stack_trace,
+                }
+            )
+            self._handler_failure_detected = True
+            self._handler_failures = []
 
     def stop_abort_polling(self) -> None:
         """Stop the background abort listener."""
@@ -538,50 +599,60 @@ class TaskContext(CoreTaskContext):
             return  # Already started
 
         def on_timeout() -> None:
-            if self._abort_detected:
-                return  # Already aborting
+            with self._lifecycle_lock:
+                if self._abort_detected or self._execution_completed:
+                    return
 
-            self._timeout_triggered = True
-
-            # Check if task has abort handler (requires app context)
-            if not self._app:
-                logger.error(
-                    "Timeout fired for task %s but no app context available",
-                    self._task_uuid,
-                )
-                return
-
-            with self._app.app_context():
-                from superset.commands.tasks.update import UpdateTaskCommand
-
-                task = self._task
-                if task.properties_dict.get("is_abortable", False):
-                    logger.info(
-                        "Timeout reached for task %s after %d seconds - "
-                        "transitioning to ABORTING and triggering abort handlers",
+                # Check if task has abort handler (requires app context)
+                if not self._app:
+                    logger.error(
+                        "Timeout fired for task %s but no app context available",
                         self._task_uuid,
-                        timeout_seconds,
                     )
-                    # Set status to ABORTING (same as user abort)
-                    # The executor will determine TIMED_OUT vs FAILURE based on
-                    # whether handlers complete successfully
-                    UpdateTaskCommand(
-                        self._task_uuid,
-                        status=TaskStatus.ABORTING.value,
-                        properties={"error_message": "Task timed out"},
-                        skip_security_check=True,
-                    ).run()
+                    return
 
-                    # Trigger abort handlers for cleanup
-                    self._on_abort_detected()
-                else:
-                    # No abort handler - just log warning
-                    logger.warning(
-                        "Timeout reached for task %s after %d seconds, but no "
-                        "abort handler is registered. Task will continue running.",
-                        self._task_uuid,
-                        timeout_seconds,
-                    )
+                with self._app.app_context():
+                    if self._properties_cache.get("is_abortable", False):
+                        from superset.commands.tasks.internal_update import (
+                            InternalStatusTransitionCommand,
+                        )
+
+                        timeout_properties = self.properties_snapshot()
+                        timeout_properties["error_message"] = "Task timed out"
+                        transitioned = InternalStatusTransitionCommand(
+                            task_uuid=self._task_uuid,
+                            new_status=TaskStatus.ABORTING,
+                            expected_status=TaskStatus.IN_PROGRESS,
+                            properties=timeout_properties,
+                        ).run()
+                        if not transitioned:
+                            logger.info(
+                                "Timeout ignored for task %s because it is no longer "
+                                "in progress",
+                                self._task_uuid,
+                            )
+                            return
+                        self._properties_cache = timeout_properties
+                        self._timeout_triggered = True
+                        logger.info(
+                            "Timeout reached for task %s after %d seconds - "
+                            "transitioning to ABORTING and triggering abort handlers",
+                            self._task_uuid,
+                            timeout_seconds,
+                        )
+                        # Trigger abort handlers for cleanup
+                        self._on_abort_detected()
+                    else:
+                        # The work cannot be interrupted, but the executor still
+                        # records that it exceeded its deadline when it returns.
+                        self._properties_cache["error_message"] = "Task timed out"
+                        self._timeout_triggered = True
+                        logger.warning(
+                            "Timeout reached for task %s after %d seconds, but no "
+                            "abort handler is registered. Task will continue running.",
+                            self._task_uuid,
+                            timeout_seconds,
+                        )
 
         self._timeout_timer = threading.Timer(timeout_seconds, on_timeout)
         # Timer is daemon so it won't prevent process exit. If the worker dies,
@@ -610,49 +681,101 @@ class TaskContext(CoreTaskContext):
     @property
     def timeout_triggered(self) -> bool:
         """Check if the timeout was triggered."""
-        return self._timeout_triggered
+        with self._lifecycle_lock:
+            return self._timeout_triggered
 
     @property
     def abort_handlers_completed(self) -> bool:
         """Check if all abort handlers have completed successfully."""
-        return self._abort_handlers_completed
+        with self._lifecycle_lock:
+            return self._abort_handlers_completed
 
-    def _run_cleanup(self) -> None:
+    @property
+    def interruption_status(self) -> TaskStatus | None:
+        """Return the terminal status implied by a detected interruption."""
+        with self._lifecycle_lock:
+            if not (self._abort_detected or self._timeout_triggered):
+                return None
+            if self._handler_failure_detected:
+                return TaskStatus.FAILURE
+            if self._timeout_triggered and not self._abort_detected:
+                return TaskStatus.TIMED_OUT
+            if self._abort_handlers_completed:
+                return (
+                    TaskStatus.TIMED_OUT
+                    if self._timeout_triggered
+                    else TaskStatus.ABORTED
+                )
+            return TaskStatus.FAILURE
+
+    @property
+    def terminal_status(self) -> TaskStatus:
+        """Return the terminal status after execution and cleanup have finished."""
+        with self._lifecycle_lock:
+            if self._execution_failed or self._handler_failure_detected:
+                return TaskStatus.FAILURE
+            return self.interruption_status or TaskStatus.SUCCESS
+
+    def _run_finalizers(self) -> None:
+        """Run success-only publication handlers in registration order."""
+        for handler in self._finalize_handlers:
+            try:
+                handler()
+            except Exception as ex:
+                stack_trace = traceback.format_exc()
+                logger.error(
+                    "Finalizer failed for task %s: %s",
+                    self._task_uuid,
+                    str(ex),
+                    exc_info=True,
+                )
+                self._handler_failures.append(("finalize", ex, stack_trace))
+                break
+
+    def _run_cleanup(self, run_finalizers: bool = False) -> None:
         """
         Run cleanup handlers (called by executor in finally block).
 
         This runs:
-        1. Flushes any pending throttled updates to ensure final state is persisted
-        2. Abort handlers if task was aborting/aborted (but not yet detected)
-        3. All cleanup handlers (always)
+        1. Stops asynchronous abort/timeout callbacks
+        2. Success-only finalizers after the executor fenced publication
+        3. Abort handlers if task was aborting/aborted (but not yet detected)
+        4. All cleanup handlers (always)
+        5. Flushes every update produced by execution or handlers
 
-        All handler failures (abort + cleanup) are collected and written to DB
-        as a unified error record at the end.
+        All handler failures (abort + cleanup) are combined into the authoritative
+        properties snapshot for the executor's terminal transition.
         """
-        # Flush any pending throttled updates before cleanup
+        # Quiesce the execution-phase deferred timer before handler execution.
+        # _deferred_flush acquires throttle -> lifecycle, so this must happen before
+        # cleanup acquires lifecycle and handlers are allowed to call update_task().
         with self._throttle_lock:
             self._cancel_deferred_flush_timer()
-            if self._has_pending_updates:
-                self._write_to_db()
-                self._has_pending_updates = False
 
         # Stop abort listener and timeout timer
         self.stop_abort_polling()
         self.stop_timeout_timer()
 
-        # If aborting/aborted but handlers haven't run yet, run them now
-        # (This catches the case where task ended before listener detected abort)
-        if self._app:
-            with self._app.app_context():
-                task = self._task
-                if task.status in ABORT_STATES and not self._abort_detected:
-                    self._trigger_abort_handlers()
-        else:
-            # Fallback without app context
+        # A listener that outlives its two-second stop grace period must finish
+        # before cleanup/finalization can inspect or mutate handler state.
+        with self._lifecycle_lock:
+            if run_finalizers and self.can_finalize:
+                self._run_finalizers()
+
+            # A directly constructed context can reach cleanup before an executor
+            # marks completion. Never start abort handlers after that boundary.
             try:
                 task = self._task
-                if task.status in ABORT_STATES and not self._abort_detected:
-                    self._trigger_abort_handlers()
+                if (
+                    task.status in ABORT_STATES
+                    and not self._abort_detected
+                    and not self._execution_completed
+                ):
+                    if self._app:
+                        with self._app.app_context():
+                            self._on_abort_detected()
+                    else:
+                        self._on_abort_detected()
             except Exception as ex:
                 logger.warning(
                     "Could not check abort status during cleanup for task %s: %s",
@@ -660,20 +783,28 @@ class TaskContext(CoreTaskContext):
                     str(ex),
                 )
 
-        # Always run cleanup handlers, collecting failures
-        for handler in reversed(self._cleanup_handlers):
-            try:
-                handler()
-            except Exception as ex:
-                stack_trace = traceback.format_exc()
-                logger.error(
-                    "Cleanup handler failed for task %s: %s",
-                    self._task_uuid,
-                    str(ex),
-                    exc_info=True,
-                )
-                self._handler_failures.append(("cleanup", ex, stack_trace))
+            # Always run cleanup handlers, collecting failures.
+            for handler in reversed(self._cleanup_handlers):
+                try:
+                    handler()
+                except Exception as ex:
+                    stack_trace = traceback.format_exc()
+                    logger.error(
+                        "Cleanup handler failed for task %s: %s",
+                        self._task_uuid,
+                        str(ex),
+                        exc_info=True,
+                    )
+                    self._handler_failures.append(("cleanup", ex, stack_trace))
 
-        # Write all collected failures (abort + cleanup) to DB as unified record
-        if self._handler_failures:
-            self._write_handler_failures_to_db()
+            # Capture failures for the executor's terminal transition.
+            if self._handler_failures:
+                self._capture_handler_failures()
+
+        # Handlers may call update_task() and schedule a new deferred flush. Seal
+        # that channel before the executor publishes the terminal state.
+        with self._throttle_lock:
+            self._cancel_deferred_flush_timer()
+            if self._has_pending_updates:
+                self._write_to_db()
+                self._has_pending_updates = False

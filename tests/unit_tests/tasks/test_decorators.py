@@ -20,13 +20,47 @@ from unittest.mock import MagicMock, patch
 from uuid import UUID
 
 import pytest
-from superset_core.tasks.types import TaskOptions, TaskScope
+from superset_core.tasks.types import TaskOptions, TaskScope, TaskStatus
 
 from superset.commands.tasks.exceptions import GlobalTaskFrameworkDisabledError
 from superset.tasks.decorators import task, TaskWrapper
 from superset.tasks.registry import TaskRegistry
 
 TEST_UUID = UUID("b8b61b7b-1cd3-4a31-a74a-0a95341afc06")
+
+
+def test_inline_execution_delegates_to_shared_runner() -> None:
+    @task(name="test_inline_late_abort")
+    def inline_task() -> None:
+        pass
+
+    task_model = MagicMock(
+        uuid=TEST_UUID,
+        status=TaskStatus.PENDING.value,
+        properties_dict={"execution_mode": "sync"},
+        payload_dict={},
+    )
+    final_task = MagicMock(status=TaskStatus.SUCCESS.value)
+    with patch(
+        "superset.tasks.executor.execute_task_callable",
+        return_value=final_task,
+    ) as execute:
+        result = inline_task._execute_inline(
+            task_model,
+            TaskOptions(timeout=10),
+            (),
+            {},
+        )
+
+    assert result is final_task
+    execute.assert_called_once_with(
+        task=task_model,
+        task_name="test_inline_late_abort",
+        function=inline_task.func,
+        args=(),
+        kwargs={},
+        timeout=10,
+    )
 
 
 class TestTaskDecoratorFeatureFlag:

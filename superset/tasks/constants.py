@@ -33,9 +33,47 @@ ACTIVE_STATES: frozenset[str] = frozenset(
     {
         TaskStatus.PENDING.value,
         TaskStatus.IN_PROGRESS.value,
+        TaskStatus.FINALIZING.value,
         TaskStatus.ABORTING.value,
     }
 )
+
+ALLOWED_STATUS_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
+    TaskStatus.PENDING: frozenset(
+        {TaskStatus.IN_PROGRESS, TaskStatus.ABORTED, TaskStatus.FAILURE}
+    ),
+    TaskStatus.IN_PROGRESS: frozenset({TaskStatus.FINALIZING, TaskStatus.ABORTING}),
+    TaskStatus.FINALIZING: frozenset(
+        {TaskStatus.SUCCESS, TaskStatus.FAILURE, TaskStatus.TIMED_OUT}
+    ),
+    TaskStatus.ABORTING: frozenset(
+        {TaskStatus.ABORTED, TaskStatus.FAILURE, TaskStatus.TIMED_OUT}
+    ),
+    TaskStatus.SUCCESS: frozenset(),
+    TaskStatus.FAILURE: frozenset(),
+    TaskStatus.ABORTED: frozenset(),
+    TaskStatus.TIMED_OUT: frozenset(),
+}
+
+
+def is_allowed_status_transition(
+    current: TaskStatus,
+    target: TaskStatus,
+) -> bool:
+    """Return whether the centralized GTF state graph permits an edge."""
+    return target in ALLOWED_STATUS_TRANSITIONS[current]
+
+
+def ensure_allowed_status_transition(
+    current: TaskStatus,
+    target: TaskStatus,
+) -> None:
+    """Raise when a production command attempts an edge outside the GTF graph."""
+    if not is_allowed_status_transition(current, target):
+        raise ValueError(
+            f"Invalid GTF status transition from {current.value} to {target.value}"
+        )
+
 
 # Abortable states: Task can be aborted (for pending or abortable in-progress)
 ABORTABLE_STATES: frozenset[str] = frozenset(

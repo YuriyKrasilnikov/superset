@@ -28,7 +28,11 @@ from superset.daos.exceptions import DAODeleteFailedError
 from superset.extensions import db
 from superset.models.task_subscribers import TaskSubscriber
 from superset.models.tasks import Task
-from superset.tasks.constants import ABORTABLE_STATES, TERMINAL_STATES
+from superset.tasks.constants import (
+    ABORTABLE_STATES,
+    ensure_allowed_status_transition,
+    TERMINAL_STATES,
+)
 from superset.tasks.filters import TaskFilter
 from superset.tasks.utils import get_active_dedup_key, get_finished_dedup_key, json
 
@@ -202,7 +206,7 @@ class TaskDAO(BaseDAO[Task]):
         - IN_PROGRESS with is_abortable=True: Goes to ABORTING
         - IN_PROGRESS with is_abortable=False/None: Raises TaskNotAbortableError
         - ABORTING: Returns task (idempotent)
-        - Finished statuses: Returns None
+        - FINALIZING and finished statuses: Returns None
 
         Note: Caller is responsible for calling TaskManager.publish_abort() AFTER
         the transaction commits if task.status == ABORTING. This prevents race
@@ -230,6 +234,10 @@ class TaskDAO(BaseDAO[Task]):
 
         # PENDING: Go directly to ABORTED
         if task.status == TaskStatus.PENDING.value:
+            ensure_allowed_status_transition(
+                TaskStatus.PENDING,
+                TaskStatus.ABORTED,
+            )
             task.set_status(TaskStatus.ABORTED)
             logger.info("Aborted pending task: %s (scope: %s)", task_uuid, task.scope)
             return task
@@ -242,6 +250,10 @@ class TaskDAO(BaseDAO[Task]):
                     "an abort handler (is_abortable is not true)"
                 )
 
+            ensure_allowed_status_transition(
+                TaskStatus.IN_PROGRESS,
+                TaskStatus.ABORTING,
+            )
             # Transition to ABORTING (not ABORTED yet)
             task.set_status(TaskStatus.ABORTING)
             db.session.merge(task)

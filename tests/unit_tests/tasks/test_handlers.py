@@ -61,6 +61,7 @@ def mock_flask_app():
     mock_app = MagicMock()
     mock_app.config = {
         "TASK_ABORT_POLLING_DEFAULT_INTERVAL": 0.1,
+        "TASK_PROGRESS_UPDATE_THROTTLE_INTERVAL": 60,
     }
     # Make app_context() return a proper context manager
     mock_app.app_context.return_value.__enter__ = MagicMock(return_value=None)
@@ -100,6 +101,68 @@ def task_context(mock_task, mock_task_dao, mock_update_command, mock_flask_app):
             ctx.stop_abort_polling()
 
 
+def test_capture_execution_failure_preserves_runtime_properties(task_context) -> None:
+    task_context._properties_cache.update(
+        {
+            "execution_mode": "async",
+            "timeout": 300,
+            "is_abortable": True,
+            "progress_percent": 0.5,
+        }
+    )
+
+    properties = task_context.capture_execution_failure(ValueError("query failed"))
+
+    assert properties == {
+        "is_abortable": True,
+        "execution_mode": "async",
+        "timeout": 300,
+        "progress_percent": 0.5,
+        "error_message": "query failed",
+        "exception_type": "ValueError",
+    }
+
+
+def test_context_without_app_uses_safe_runtime_defaults_for_updates() -> None:
+    task = MagicMock(
+        uuid=TEST_UUID,
+        properties_dict={"execution_mode": "sync"},
+        payload_dict={},
+    )
+    with patch("superset.tasks.context.current_app") as mock_current_app:
+        mock_current_app._get_current_object = Mock(side_effect=RuntimeError)
+        context = TaskContext(task)
+
+    with patch(
+        "superset.commands.tasks.internal_update.InternalUpdateTaskCommand"
+    ) as update:
+        context.update_task(payload={"result": "complete"})
+
+    update.assert_called_once()
+    assert update.call_args.kwargs["payload"] == {"result": "complete"}
+
+
+def test_cleanup_failure_keeps_original_execution_error(
+    task_context,
+    mock_update_command,
+) -> None:
+    task_context.capture_execution_failure(ValueError("query failed"))
+    task_context._handler_failures.append(
+        ("cleanup", RuntimeError("cleanup failed"), "cleanup trace")
+    )
+
+    task_context._capture_handler_failures()
+
+    assert task_context.properties_snapshot() == {
+        "is_abortable": False,
+        "error_message": "query failed | Cleanup handler failed: cleanup failed",
+        "exception_type": "ValueError+RuntimeError",
+        "stack_trace": "cleanup trace",
+    }
+    assert task_context.terminal_status == TaskStatus.FAILURE
+    mock_update_command.assert_not_called()
+
+
 class TestTaskStatusEnum:
     """Test TaskStatus enum values."""
 
@@ -113,6 +176,7 @@ class TestTaskStatusEnum:
         expected_statuses = [
             "pending",
             "in_progress",
+            "finalizing",
             "success",
             "failure",
             "aborting",
@@ -535,14 +599,14 @@ class TestBestEffortHandlerExecution:
         calls = []
         captured_failures = []
 
-        # Mock _write_handler_failures_to_db to capture failures before clearing
-        original_write = task_context._write_handler_failures_to_db
+        # Capture failures before TaskContext combines and clears them.
+        original_capture = task_context._capture_handler_failures
 
         def mock_write():
             captured_failures.extend(task_context._handler_failures)
-            original_write()
+            original_capture()
 
-        task_context._write_handler_failures_to_db = mock_write
+        task_context._capture_handler_failures = mock_write
 
         @task_context.on_cleanup
         def cleanup1():
@@ -582,14 +646,14 @@ class TestBestEffortHandlerExecution:
         calls = []
         captured_failures = []
 
-        # Mock _write_handler_failures_to_db to capture failures before clearing
-        original_write = task_context._write_handler_failures_to_db
+        # Capture failures before TaskContext combines and clears them.
+        original_capture = task_context._capture_handler_failures
 
         def mock_write():
             captured_failures.extend(task_context._handler_failures)
-            original_write()
+            original_capture()
 
-        task_context._write_handler_failures_to_db = mock_write
+        task_context._capture_handler_failures = mock_write
 
         @task_context.on_abort
         def abort1():
@@ -633,6 +697,59 @@ class TestBestEffortHandlerExecution:
 
 class TestCleanupHandlers:
     """Test cleanup handler behavior."""
+
+    def test_fenced_finalizers_run_before_cleanup(self, task_context) -> None:
+        calls: list[str] = []
+
+        task_context.on_finalize(lambda: calls.append("finalize-1"))
+        task_context.on_finalize(lambda: calls.append("finalize-2"))
+        task_context.on_cleanup(lambda: calls.append("cleanup"))
+
+        task_context._run_cleanup(run_finalizers=True)
+
+        assert calls == ["finalize-1", "finalize-2", "cleanup"]
+
+    def test_finalizer_failure_stops_publication_and_fails_task(
+        self, task_context
+    ) -> None:
+        later_finalizer = MagicMock()
+
+        @task_context.on_finalize
+        def fail_publication() -> None:
+            raise RuntimeError("publication failed")
+
+        task_context.on_finalize(later_finalizer)
+        task_context._run_cleanup(run_finalizers=True)
+
+        later_finalizer.assert_not_called()
+        assert task_context.terminal_status == TaskStatus.FAILURE
+        assert task_context.properties_snapshot()["error_message"] == (
+            "Finalize handler failed: publication failed"
+        )
+
+    def test_cleanup_flushes_updates_created_by_cleanup_handlers(
+        self,
+        task_context,
+    ) -> None:
+        task_context._last_db_write_time = time.time()
+        execution_timer = MagicMock()
+        task_context._deferred_flush_timer = execution_timer
+
+        @task_context.on_cleanup
+        def update_payload() -> None:
+            execution_timer.cancel.assert_called_once_with()
+            assert task_context._deferred_flush_timer is None
+            task_context.update_task(payload={"cleanup": "complete"})
+
+        with patch(
+            "superset.commands.tasks.internal_update.InternalUpdateTaskCommand"
+        ) as update:
+            task_context._run_cleanup()
+
+        update.assert_called_once()
+        assert update.call_args.kwargs["payload"] == {"cleanup": "complete"}
+        assert task_context._deferred_flush_timer is None
+        assert task_context._has_pending_updates is False
 
     def test_cleanup_triggers_abort_handlers_if_not_detected(
         self, task_context, mock_task

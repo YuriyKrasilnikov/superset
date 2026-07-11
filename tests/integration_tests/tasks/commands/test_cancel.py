@@ -50,7 +50,12 @@ def test_cancel_pending_task_aborts(app_context, get_user) -> None:
 
     try:
         # Cancel the pending task with admin user context
-        with override_user(admin):
+        with (
+            override_user(admin),
+            patch(
+                "superset.tasks.manager.TaskManager.publish_completion"
+            ) as publish_completion,
+        ):
             command = CancelTaskCommand(task_uuid=task.uuid)
             result = command.run()
 
@@ -58,6 +63,10 @@ def test_cancel_pending_task_aborts(app_context, get_user) -> None:
         assert result.uuid == task.uuid
         assert result.status == TaskStatus.ABORTED.value
         assert command.action_taken == "aborted"
+        publish_completion.assert_called_once_with(
+            task.uuid,
+            TaskStatus.ABORTED.value,
+        )
 
         # Verify in database
         db.session.refresh(task)

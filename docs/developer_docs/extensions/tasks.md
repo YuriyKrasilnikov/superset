@@ -89,21 +89,22 @@ Both execution modes provide the same task features: deduplication, progress tra
 ## Task Lifecycle
 
 ```
-PENDING ──→ IN_PROGRESS ────→ SUCCESS
-   │             │
-   │             ├──────────→ FAILURE
-   │             ↓                ↑
-   │         ABORTING ────────────┘
-   │             │
-   │             ├──────────→ TIMED_OUT (timeout)
-   │             │
-   └─────────────┴──────────→ ABORTED (user cancel)
+PENDING ──→ IN_PROGRESS ──→ FINALIZING ──→ SUCCESS
+   │             │                ├──────→ FAILURE
+   │             │                └──────→ TIMED_OUT
+   │             ↓
+   │         ABORTING ────────────→ ABORTED
+   │             ├───────────────→ FAILURE
+   │             └───────────────→ TIMED_OUT
+   ├─────────────────────────────→ ABORTED
+   └─────────────────────────────→ FAILURE
 ```
 
 | Status | Description |
 |--------|-------------|
 | `PENDING` | Queued, awaiting execution |
 | `IN_PROGRESS` | Executing |
+| `FINALIZING` | Task body completed; success-only publication and cleanup are running |
 | `ABORTING` | Abort/timeout triggered, abort handlers running |
 | `SUCCESS` | Completed successfully |
 | `FAILURE` | Failed with error or abort/cleanup handler exception |
@@ -151,16 +152,17 @@ Use the tuple format `(current, total)` whenever possible. It provides the riche
 
 #### Payload
 
-The `payload` parameter stores custom metadata that can help users understand what the task is doing. Each call to `update_task()` replaces the previous payload completely.
+The `payload` parameter stores custom metadata that can help users understand what the task is doing. Each call to `update_task()` merges the supplied keys into the current payload.
 
 In the Task List UI, when a payload is defined, an info icon appears in the **Details** column. Users can hover over it to see the JSON content.
 
 ### Handlers
 
-Register handlers to run cleanup logic or respond to abort requests:
+Register handlers to publish results, run cleanup logic, or respond to abort requests:
 
 | Handler | When it runs | Use case |
 |---------|--------------|----------|
+| `on_finalize` | After the executor fences successful completion | Publish a durable result after cancellation can no longer win |
 | `on_cleanup` | Always (success, failure, abort) | Release resources, close connections |
 | `on_abort` | When task is aborted | Set stop flag, cancel external operations |
 
@@ -168,6 +170,10 @@ Register handlers to run cleanup logic or respond to abort requests:
 @task
 def my_task() -> None:
     ctx = get_context()
+
+    @ctx.on_finalize
+    def publish():
+        logger.info("Task result is ready")
 
     @ctx.on_cleanup
     def cleanup():
@@ -180,11 +186,11 @@ def my_task() -> None:
     # ... task logic
 ```
 
-Multiple handlers of the same type execute in LIFO order (last registered runs first). Abort handlers run first when abort is detected, then cleanup handlers run when the task ends.
+Finalizers execute in registration order after the task enters `FINALIZING`. Abort and cleanup handlers execute in LIFO order. Finalizers are skipped after failure, cancellation, or timeout; cleanup handlers always run. If a finalizer fails, later finalizers are skipped and the task fails, while cleanup still runs.
 
 #### Best-Effort Execution
 
-**All registered handlers will always be attempted, even if one fails.** This ensures that a failure in one handler doesn't prevent other handlers from running their cleanup logic.
+**All registered abort and cleanup handlers are attempted, even if one fails.** This ensures that a failure in one cleanup path doesn't prevent the remaining cleanup handlers from running. Finalizers are different: publication stops on the first finalizer failure so later results are not exposed after an earlier publication step failed.
 
 For example, if you have three cleanup handlers and the second one throws an exception:
 1. Handler 3 runs ✓
@@ -367,7 +373,7 @@ CELERY_CONFIG.beat_schedule["prune_tasks"] = {
 }
 ```
 
-The prune job only removes tasks in terminal states (`SUCCESS`, `FAILURE`, `ABORTED`, `TIMED_OUT`). Active tasks (`PENDING`, `IN_PROGRESS`, `ABORTING`) are never pruned.
+The prune job only removes tasks in terminal states (`SUCCESS`, `FAILURE`, `ABORTED`, `TIMED_OUT`). Active tasks (`PENDING`, `IN_PROGRESS`, `FINALIZING`, `ABORTING`) are never pruned.
 
 See `superset/config.py` for a complete example configuration.
 
@@ -396,6 +402,7 @@ By default, abort detection and sync join-and-wait use database polling. Configu
 | Method | Description |
 |--------|-------------|
 | `update_task(progress, payload)` | Update progress and/or custom payload |
+| `on_finalize(handler)` | Register success-only result publication after finalization is fenced |
 | `on_cleanup(handler)` | Register cleanup handler |
 | `on_abort(handler)` | Register abort handler (makes task abortable) |
 

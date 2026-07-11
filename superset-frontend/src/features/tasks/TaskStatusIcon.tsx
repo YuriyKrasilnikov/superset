@@ -32,6 +32,7 @@ function getStatusColor(status: TaskStatus, theme: SupersetTheme): string {
     case TaskStatus.Pending:
       return theme.colorPrimaryText;
     case TaskStatus.InProgress:
+    case TaskStatus.Finalizing:
       return theme.colorPrimaryText;
     case TaskStatus.Success:
       return theme.colorSuccessText;
@@ -51,6 +52,7 @@ function getStatusColor(status: TaskStatus, theme: SupersetTheme): string {
 const statusIcons = {
   [TaskStatus.Pending]: Icons.ClockCircleOutlined,
   [TaskStatus.InProgress]: Icons.LoadingOutlined,
+  [TaskStatus.Finalizing]: Icons.LoadingOutlined,
   [TaskStatus.Success]: Icons.CheckCircleOutlined,
   [TaskStatus.Failure]: Icons.CloseCircleOutlined,
   [TaskStatus.TimedOut]: Icons.ClockCircleOutlined, // Clock to indicate timeout
@@ -61,6 +63,7 @@ const statusIcons = {
 const statusLabels = {
   [TaskStatus.Pending]: t('Pending'),
   [TaskStatus.InProgress]: t('In Progress'),
+  [TaskStatus.Finalizing]: t('Finalizing'),
   [TaskStatus.Success]: t('Success'),
   [TaskStatus.Failure]: t('Failed'),
   [TaskStatus.TimedOut]: t('Timed Out'),
@@ -94,7 +97,11 @@ export default function TaskStatusIcon({
 
   // Build tooltip content based on status
   let tooltipContent: React.ReactNode;
-  if (status === TaskStatus.InProgress || status === TaskStatus.Aborting) {
+  if (
+    status === TaskStatus.InProgress ||
+    status === TaskStatus.Finalizing ||
+    status === TaskStatus.Aborting
+  ) {
     // Progress tooltip for active tasks (multiline)
     const lines = formatProgressTooltip(
       label,
@@ -134,7 +141,9 @@ export default function TaskStatusIcon({
 
   // Spin for in-progress and aborting states
   const shouldSpin =
-    status === TaskStatus.InProgress || status === TaskStatus.Aborting;
+    status === TaskStatus.InProgress ||
+    status === TaskStatus.Finalizing ||
+    status === TaskStatus.Aborting;
 
   return (
     <Tooltip title={tooltipContent} placement="top">
