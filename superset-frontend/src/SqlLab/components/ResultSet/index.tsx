@@ -239,13 +239,19 @@ const ResultSet = ({
   const logAction = useLogAction({ queryId, sqlEditorId: query.sqlEditorId });
   const { showConfirm, ConfirmModal } = useConfirmModal();
 
-  const { progress, startExport, resetExport, retryExport, cancelExport } =
-    useStreamingExport({
-      onComplete: () => {},
-      onError: error => {
-        addDangerToast(t('Export failed: %s', error));
-      },
-    });
+  const {
+    progress,
+    prepareExport,
+    startExport,
+    resetExport,
+    retryExport,
+    cancelExport,
+  } = useStreamingExport({
+    onComplete: () => {},
+    onError: error => {
+      addDangerToast(t('Export failed: %s', error));
+    },
+  });
 
   const reRunQueryIfSessionTimeoutErrorOnMount = useCallback(() => {
     if (
@@ -423,12 +429,21 @@ const ResultSet = ({
                   href: getExportCsvUrl(query.id),
                 })}
               data-test="export-csv-button"
-              onClick={e => {
+              onClick={async e => {
                 if (!canExportData) return;
                 const useStreaming = shouldUseStreamingExport();
 
                 if (useStreaming) {
                   e.preventDefault();
+                  const exportName = (query.tab || 'export').replace(
+                    /[^a-zA-Z0-9_-]/g,
+                    '_',
+                  );
+                  const target = await prepareExport(
+                    `${exportName}.csv`,
+                    'csv',
+                  );
+                  if (!target) return;
                   setShowStreamingModal(true);
 
                   startExport({
@@ -437,6 +452,7 @@ const ResultSet = ({
                     exportType: 'csv',
                     exportSource: 'sqllab',
                     expectedRows: rows,
+                    target,
                   });
                 } else {
                   handleDownloadCsv(e);

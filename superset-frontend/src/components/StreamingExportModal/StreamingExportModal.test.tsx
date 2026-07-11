@@ -84,6 +84,22 @@ test('shows completed state when export finishes', () => {
   expect(screen.getByRole('button', { name: 'Download' })).toBeEnabled();
 });
 
+test('does not offer a second download after saving directly to a file', () => {
+  const progress = {
+    ...defaultProgress,
+    rowsProcessed: 1000,
+    status: ExportStatus.COMPLETED,
+    savedDirectly: true,
+  };
+
+  render(<StreamingExportModal {...defaultProps} progress={progress} />);
+
+  expect(screen.getByRole('button', { name: 'Close' })).toBeInTheDocument();
+  expect(
+    screen.queryByRole('button', { name: 'Download' }),
+  ).not.toBeInTheDocument();
+});
+
 test('shows error state when export fails', () => {
   const progress = {
     ...defaultProgress,

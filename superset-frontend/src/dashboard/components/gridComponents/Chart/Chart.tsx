@@ -265,17 +265,21 @@ const Chart = (props: ChartProps) => {
   const [width, setWidth] = useState(props.width);
 
   const [isStreamingModalVisible, setIsStreamingModalVisible] = useState(false);
-  const { progress, startExport, cancelExport, resetExport, retryExport } =
-    useStreamingExport({
-      onComplete: () => {
-        // Don't show toast here - wait for user to click Download button
-      },
-      onError: () => {
-        boundActionCreators.addDangerToast(
-          t('Export failed - please try again'),
-        );
-      },
-    });
+  const {
+    progress,
+    prepareExport,
+    startExport,
+    cancelExport,
+    resetExport,
+    retryExport,
+  } = useStreamingExport({
+    onComplete: () => {
+      // Don't show toast here - wait for user to click Download button
+    },
+    onError: () => {
+      boundActionCreators.addDangerToast(t('Export failed - please try again'));
+    },
+  });
 
   const handleDownloadComplete = useCallback(() => {
     boundActionCreators.addSuccessToast(t('CSV file downloaded successfully'));
@@ -537,7 +541,8 @@ const Chart = (props: ChartProps) => {
         actualRowCount = (queriesResponse![0] as JsonObject).rowcount as number;
       } else {
         actualRowCount = (exportFormData as JsonObject)?.row_limit as
-          number | undefined;
+          | number
+          | undefined;
       }
 
       // Handle streaming CSV exports based on row threshold
@@ -558,7 +563,9 @@ const Chart = (props: ChartProps) => {
           /[^a-zA-Z0-9_-]/g,
           '_',
         );
-        filename = `${safeChartName}${timestamp}.csv`;
+        const extension =
+          queriesResponse && queriesResponse.length > 1 ? 'zip' : 'csv';
+        filename = `${safeChartName}${timestamp}.${extension}`;
       }
       const baseOwnState =
         (dataMask[props.id]?.ownState as Record<string, unknown>) || {};
@@ -576,6 +583,12 @@ const Chart = (props: ChartProps) => {
         : baseOwnState;
 
       try {
+        const exportTarget = shouldUseStreaming
+          ? await prepareExport(filename, 'csv')
+          : undefined;
+        if (shouldUseStreaming && !exportTarget) {
+          return;
+        }
         await exportChart({
           formData:
             exportFormData as unknown as import('@superset-ui/core').QueryFormData,
@@ -589,6 +602,7 @@ const Chart = (props: ChartProps) => {
                   ...(exportParams as Record<string, unknown>),
                   filename,
                   expectedRows: actualRowCount,
+                  target: exportTarget,
                 } as Parameters<typeof startExport>[0]);
               }
             : null,
@@ -629,6 +643,7 @@ const Chart = (props: ChartProps) => {
       boundActionCreators.logEvent,
       boundActionCreators.addDangerToast,
       queriesResponse,
+      prepareExport,
       startExport,
       resetExport,
       streamingThreshold,

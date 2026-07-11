@@ -17,19 +17,17 @@
  * under the License.
  */
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { SupersetClient } from '@superset-ui/core';
+import { JsonObject, SupersetClient } from '@superset-ui/core';
 import { ExportStatus, StreamingProgress } from './StreamingExportModal';
 import { makeUrl } from 'src/utils/navigationUtils';
 import { applicationRoot } from 'src/utils/getBootstrapData';
 
 interface UseStreamingExportOptions {
-  onComplete?: (downloadUrl: string, filename: string) => void;
+  onComplete?: (downloadUrl: string | undefined, filename: string) => void;
   onError?: (error: string) => void;
 }
 
-interface StreamingExportPayload {
-  [key: string]: any;
-}
+type StreamingExportPayload = JsonObject;
 
 type StreamingExportSource = 'chart' | 'sqllab';
 
@@ -50,9 +48,54 @@ interface StreamingExportParams {
   exportType: 'csv' | 'xlsx';
   exportSource?: StreamingExportSource;
   expectedRows?: number;
+  target?: PreparedExportTarget;
 }
 
 const NEWLINE_BYTE = 10; // '\n' character code
+const BLOB_FALLBACK_MAX_BYTES = 256 * 1024 * 1024;
+const TASK_POLL_INTERVAL_MS = 1000;
+const STREAM_ERROR_MARKER = '__STREAM_ERROR__:';
+
+interface WritableFileStream {
+  write(data: Uint8Array): Promise<void>;
+  close(): Promise<void>;
+  abort(reason?: unknown): Promise<void>;
+}
+
+interface WritableFileHandle {
+  createWritable(): Promise<WritableFileStream>;
+}
+
+interface SaveFilePickerWindow extends Window {
+  showSaveFilePicker?: (options: {
+    suggestedName: string;
+    types: Array<{
+      description: string;
+      accept: Record<string, string[]>;
+    }>;
+  }) => Promise<WritableFileHandle>;
+}
+
+export type PreparedExportTarget =
+  | { kind: 'file-system'; handle: WritableFileHandle }
+  | { kind: 'blob' };
+
+interface ArtifactExportResponse {
+  task_uuid: string;
+  status_url: string;
+  artifact_url: string;
+}
+
+interface ExportSinkResult {
+  downloadUrl?: string;
+  savedDirectly: boolean;
+}
+
+interface ExportSink {
+  write(chunk: Uint8Array): Promise<void>;
+  close(): Promise<ExportSinkResult>;
+  abort(reason?: unknown): Promise<void>;
+}
 
 /**
  * Ensures URL has the application root prefix for subdirectory deployments.
@@ -155,24 +198,171 @@ const createFetchRequest = async (
 const countNewlines = (value: Uint8Array): number =>
   value.filter(byte => byte === NEWLINE_BYTE).length;
 
-const createBlob = (
-  chunks: Uint8Array[],
-  receivedLength: number,
-  exportType: string,
-): Blob => {
-  const completeData = new Uint8Array(receivedLength);
-  let position = 0;
-  for (const chunk of chunks) {
-    completeData.set(chunk, position);
-    position += chunk.length;
+const getExportMimeType = (exportType: string): string =>
+  exportType === 'csv'
+    ? 'text/csv;charset=utf-8'
+    : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+const getPickerMimeType = (exportType: string): string =>
+  exportType === 'csv'
+    ? 'text/csv'
+    : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+const prepareExportTarget = async (
+  filename: string | undefined,
+  exportType: 'csv' | 'xlsx',
+): Promise<PreparedExportTarget | null> => {
+  const picker = (window as SaveFilePickerWindow).showSaveFilePicker;
+  if (!picker) {
+    return { kind: 'blob' };
   }
 
-  const mimeType =
-    exportType === 'csv'
-      ? 'text/csv;charset=utf-8'
-      : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  const isZip = filename?.toLowerCase().endsWith('.zip') ?? false;
+  const extension = isZip ? '.zip' : exportType === 'csv' ? '.csv' : '.xlsx';
+  const pickerMimeType = isZip
+    ? 'application/zip'
+    : getPickerMimeType(exportType);
+  try {
+    const handle = await picker.call(window, {
+      suggestedName: filename || `export${extension}`,
+      types: [
+        {
+          description: isZip
+            ? 'ZIP archive'
+            : exportType === 'csv'
+              ? 'CSV file'
+              : 'Excel workbook',
+          accept: { [pickerMimeType]: [extension] },
+        },
+      ],
+    });
+    return { kind: 'file-system', handle };
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      return null;
+    }
+    throw error;
+  }
+};
 
-  return new Blob([completeData], { type: mimeType });
+const createExportSink = async (
+  target: PreparedExportTarget,
+  contentType: string,
+  declaredSize: number | undefined,
+): Promise<ExportSink> => {
+  if (target.kind === 'file-system') {
+    const writable = await target.handle.createWritable();
+    return {
+      write: chunk => writable.write(chunk),
+      close: async () => {
+        await writable.close();
+        return { savedDirectly: true };
+      },
+      abort: reason => writable.abort(reason),
+    };
+  }
+
+  if (declaredSize !== undefined && declaredSize > BLOB_FALLBACK_MAX_BYTES) {
+    throw new Error(
+      'This export is too large for this browser. Use a browser that supports saving streamed files.',
+    );
+  }
+
+  const chunks: Uint8Array[] = [];
+  let receivedLength = 0;
+  return {
+    write: async chunk => {
+      if (receivedLength + chunk.length > BLOB_FALLBACK_MAX_BYTES) {
+        throw new Error(
+          'This export exceeded the browser memory fallback limit. Use a browser that supports saving streamed files.',
+        );
+      }
+      // Retain only the visible bytes; a view can otherwise keep a much larger
+      // response ArrayBuffer alive and defeat the fallback memory bound.
+      chunks.push(chunk.slice());
+      receivedLength += chunk.length;
+    },
+    close: async () => {
+      const blob = new Blob(chunks, { type: contentType });
+      chunks.length = 0;
+      return { downloadUrl: URL.createObjectURL(blob), savedDirectly: false };
+    },
+    abort: async () => {
+      chunks.length = 0;
+    },
+  };
+};
+
+const isArtifactExportResponse = (
+  value: unknown,
+): value is ArtifactExportResponse => {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.task_uuid === 'string' &&
+    typeof candidate.status_url === 'string' &&
+    typeof candidate.artifact_url === 'string'
+  );
+};
+
+const waitForNextPoll = (signal: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('Export cancelled by user', 'AbortError'));
+    };
+    timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, TASK_POLL_INTERVAL_MS);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+
+const waitForArtifact = async (
+  accepted: ArtifactExportResponse,
+  signal: AbortSignal,
+): Promise<Response> => {
+  const activeStatuses = new Set(['pending', 'in_progress', 'aborting']);
+  let shouldWait = false;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    if (shouldWait) {
+      // eslint-disable-next-line no-await-in-loop
+      await waitForNextPoll(signal);
+    }
+    shouldWait = true;
+    if (signal.aborted) {
+      throw new DOMException('Export cancelled by user', 'AbortError');
+    }
+    // eslint-disable-next-line no-await-in-loop
+    const statusResponse = await fetch(ensureUrlPrefix(accepted.status_url), {
+      credentials: 'same-origin',
+      signal,
+    });
+    if (!statusResponse.ok) {
+      throw new Error(
+        `Export status failed: ${statusResponse.status} ${statusResponse.statusText}`,
+      );
+    }
+    // eslint-disable-next-line no-await-in-loop
+    const statusPayload = (await statusResponse.json()) as unknown;
+    const status =
+      statusPayload && typeof statusPayload === 'object'
+        ? (statusPayload as Record<string, unknown>).status
+        : undefined;
+    if (status === 'success') {
+      return fetch(ensureUrlPrefix(accepted.artifact_url), {
+        credentials: 'same-origin',
+        signal,
+      });
+    }
+    if (typeof status !== 'string' || !activeStatuses.has(status)) {
+      throw new Error(`Export task ended with status: ${String(status)}`);
+    }
+  }
 };
 
 export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
@@ -187,6 +377,8 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
   });
   const [retryCount, setRetryCount] = useState(0);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const activeTaskUuidRef = useRef<string | null>(null);
+  const executionIdRef = useRef(0);
   const lastExportParamsRef = useRef<StreamingExportParams | null>(null);
   const currentBlobUrlRef = useRef<string | null>(null);
   const isExportingRef = useRef(false);
@@ -197,16 +389,34 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
 
   const executeExport = useCallback(
     async (params: StreamingExportParams) => {
-      const { url, payload, filename, exportType, exportSource, expectedRows } =
-        params;
+      const {
+        url,
+        payload,
+        filename,
+        exportType,
+        exportSource,
+        expectedRows,
+        target = { kind: 'blob' },
+      } = params;
       if (isExportingRef.current) {
         return;
       }
       isExportingRef.current = true;
+      executionIdRef.current += 1;
+      const executionId = executionIdRef.current;
 
-      abortControllerRef.current = new AbortController();
+      const abortController = new AbortController();
+      abortControllerRef.current = abortController;
+      let sink: ExportSink | null = null;
+      const updateCurrentProgress = (updates: Partial<StreamingProgress>) => {
+        if (executionIdRef.current === executionId) {
+          updateProgress(updates);
+        }
+      };
+      const isSqlLabExport =
+        exportSource === 'sqllab' || 'client_id' in payload;
 
-      updateProgress({
+      updateCurrentProgress({
         rowsProcessed: 0,
         totalRows: expectedRows,
         totalSize: 0,
@@ -225,16 +435,40 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
           exportType,
           exportSource,
           expectedRows,
-          abortControllerRef.current.signal,
+          abortController.signal,
         );
         // Guard: ensure URL has app root prefix for subdirectory deployments
         const prefixedUrl = ensureUrlPrefix(url);
-        const response = await fetch(prefixedUrl, fetchOptions);
+        let response = await fetch(prefixedUrl, fetchOptions);
 
         if (!response.ok) {
           throw new Error(
             `Export failed: ${response.status} ${response.statusText}`,
           );
+        }
+
+        if (response.status === 202) {
+          const acceptedPayload = (await response.json()) as unknown;
+          if (!isArtifactExportResponse(acceptedPayload)) {
+            throw new Error('Export service returned an invalid task response');
+          }
+          if (executionIdRef.current !== executionId) {
+            SupersetClient.post({
+              endpoint: `/api/v1/task/${acceptedPayload.task_uuid}/cancel`,
+              jsonPayload: {},
+            }).catch(() => undefined);
+            throw new DOMException('Export cancelled by user', 'AbortError');
+          }
+          activeTaskUuidRef.current = acceptedPayload.task_uuid;
+          response = await waitForArtifact(
+            acceptedPayload,
+            abortController.signal,
+          );
+          if (!response.ok) {
+            throw new Error(
+              `Artifact download failed: ${response.status} ${response.statusText}`,
+            );
+          }
         }
 
         if (!response.body) {
@@ -254,10 +488,19 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
         }
 
         const reader = response.body.getReader();
-        const chunks: Uint8Array[] = [];
+        const contentLength = response.headers.get('Content-Length');
+        const declaredSize = contentLength
+          ? Number.parseInt(contentLength, 10)
+          : undefined;
+        sink = await createExportSink(
+          target,
+          response.headers.get('Content-Type') || getExportMimeType(exportType),
+          Number.isFinite(declaredSize) ? declaredSize : undefined,
+        );
         let receivedLength = 0;
         let rowsProcessed = 0;
-        let hasError = false;
+        const markerDecoder = new TextDecoder();
+        let markerTail = '';
 
         // eslint-disable-next-line no-constant-condition
         while (true) {
@@ -268,36 +511,27 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
             break;
           }
 
-          if (abortControllerRef.current?.signal.aborted) {
-            throw new Error('Export cancelled by user');
+          if (abortController.signal.aborted) {
+            throw new DOMException('Export cancelled by user', 'AbortError');
           }
 
-          // Check for error marker in the chunk
-          const textDecoder = new TextDecoder();
-          const chunkText = textDecoder.decode(value);
-
-          if (chunkText.includes('__STREAM_ERROR__')) {
-            const errorMatch = chunkText.match(/__STREAM_ERROR__:(.+)/);
-            const errorMsg = errorMatch
-              ? errorMatch[1].trim()
-              : 'Export failed. Please try again.';
-
-            // Update progress to show error with current progress preserved
-            updateProgress({
-              status: ExportStatus.ERROR,
-              error: errorMsg,
-              rowsProcessed,
-              totalRows: expectedRows,
-              totalSize: receivedLength,
-            });
-
-            isExportingRef.current = false;
-            options.onError?.(errorMsg);
-            hasError = true;
-            break;
+          if (isSqlLabExport) {
+            const markerText =
+              markerTail + markerDecoder.decode(value, { stream: true });
+            const markerIndex = markerText.indexOf(STREAM_ERROR_MARKER);
+            if (markerIndex >= 0) {
+              const errorMessage = markerText
+                .slice(markerIndex + STREAM_ERROR_MARKER.length)
+                .trim();
+              throw new Error(
+                errorMessage || 'Export failed. Please try again.',
+              );
+            }
+            markerTail = markerText.slice(-STREAM_ERROR_MARKER.length);
           }
 
-          chunks.push(value);
+          // eslint-disable-next-line no-await-in-loop
+          await sink.write(value);
           receivedLength += value.length;
 
           // Count newlines using filter (more efficient than loop)
@@ -306,7 +540,7 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
           rowsProcessed += countNewlines(value);
 
           // Update progress based on rows processed
-          updateProgress({
+          updateCurrentProgress({
             status: ExportStatus.STREAMING,
             rowsProcessed,
             totalRows: expectedRows,
@@ -315,50 +549,60 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
           });
         }
 
-        // Check if we exited early due to error marker
-        if (hasError) {
+        const sinkResult = await sink.close();
+        sink = null;
+        if (executionIdRef.current !== executionId) {
+          if (sinkResult.downloadUrl) {
+            URL.revokeObjectURL(sinkResult.downloadUrl);
+          }
           return;
         }
-
-        const blob = createBlob(chunks, receivedLength, exportType);
-
-        if (currentBlobUrlRef.current) {
-          URL.revokeObjectURL(currentBlobUrlRef.current);
+        if (sinkResult.downloadUrl) {
+          if (currentBlobUrlRef.current) {
+            URL.revokeObjectURL(currentBlobUrlRef.current);
+          }
+          currentBlobUrlRef.current = sinkResult.downloadUrl;
         }
 
-        const downloadUrl = URL.createObjectURL(blob);
-        currentBlobUrlRef.current = downloadUrl;
-
-        updateProgress({
+        updateCurrentProgress({
           status: ExportStatus.COMPLETED,
-          downloadUrl,
+          downloadUrl: sinkResult.downloadUrl,
           filename: serverFilename,
+          savedDirectly: sinkResult.savedDirectly,
         });
 
-        isExportingRef.current = false;
-        options.onComplete?.(downloadUrl, serverFilename);
+        if (executionIdRef.current === executionId) {
+          options.onComplete?.(sinkResult.downloadUrl, serverFilename);
+        }
       } catch (error) {
+        await sink?.abort(error);
+        if (executionIdRef.current !== executionId) {
+          return;
+        }
         const errorMessage =
           error instanceof Error ? error.message : 'Unknown error occurred';
 
         if (
+          (error instanceof DOMException && error.name === 'AbortError') ||
           errorMessage.includes('cancelled') ||
           errorMessage.includes('aborted')
         ) {
-          updateProgress({
+          updateCurrentProgress({
             status: ExportStatus.CANCELLED,
           });
-          isExportingRef.current = false;
         } else {
-          updateProgress({
+          updateCurrentProgress({
             status: ExportStatus.ERROR,
             error: errorMessage,
           });
           options.onError?.(errorMessage);
-          isExportingRef.current = false;
         }
       } finally {
-        abortControllerRef.current = null;
+        if (executionIdRef.current === executionId) {
+          isExportingRef.current = false;
+          activeTaskUuidRef.current = null;
+          abortControllerRef.current = null;
+        }
       }
     },
     [updateProgress, options],
@@ -371,7 +615,14 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
       }
 
       setRetryCount(0);
-      lastExportParamsRef.current = params;
+      const target =
+        params.target ||
+        (await prepareExportTarget(params.filename, params.exportType));
+      if (!target) {
+        return;
+      }
+      const preparedParams = { ...params, target };
+      lastExportParamsRef.current = preparedParams;
 
       updateProgress({
         rowsProcessed: 0,
@@ -384,7 +635,7 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
         filename: params.filename,
       });
 
-      executeExport(params);
+      executeExport(preparedParams);
     },
     [updateProgress, executeExport],
   );
@@ -403,21 +654,38 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
   }, [executeExport]);
 
   const cancelExport = useCallback(() => {
+    const taskUuid = activeTaskUuidRef.current;
+    activeTaskUuidRef.current = null;
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       updateProgress({
         status: ExportStatus.CANCELLED,
       });
     }
+    if (taskUuid) {
+      SupersetClient.post({
+        endpoint: `/api/v1/task/${taskUuid}/cancel`,
+        jsonPayload: {},
+      }).catch(() => undefined);
+    }
   }, [updateProgress]);
 
+  const prepareExport = useCallback(
+    (filename: string | undefined, exportType: 'csv' | 'xlsx') =>
+      prepareExportTarget(filename, exportType),
+    [],
+  );
+
   const resetExport = useCallback(() => {
+    cancelExport();
+    executionIdRef.current += 1;
     if (currentBlobUrlRef.current) {
       URL.revokeObjectURL(currentBlobUrlRef.current);
       currentBlobUrlRef.current = null;
     }
 
     isExportingRef.current = false;
+    activeTaskUuidRef.current = null;
     abortControllerRef.current = null;
     setProgress({
       rowsProcessed: 0,
@@ -428,13 +696,25 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
       elapsedTime: 0,
       status: ExportStatus.STREAMING,
     });
-  }, []);
+  }, [cancelExport]);
 
   // Cleanup blob URL on unmount to prevent memory leak
   useEffect(
     () => () => {
+      executionIdRef.current += 1;
+      abortControllerRef.current?.abort();
+      if (activeTaskUuidRef.current) {
+        SupersetClient.post({
+          endpoint: `/api/v1/task/${activeTaskUuidRef.current}/cancel`,
+          jsonPayload: {},
+        }).catch(() => undefined);
+      }
+      activeTaskUuidRef.current = null;
+      abortControllerRef.current = null;
+      isExportingRef.current = false;
       if (currentBlobUrlRef.current) {
         URL.revokeObjectURL(currentBlobUrlRef.current);
+        currentBlobUrlRef.current = null;
       }
     },
     [],
@@ -444,6 +724,7 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
     progress,
     isExporting: isExportingRef.current,
     retryCount,
+    prepareExport,
     startExport,
     cancelExport,
     resetExport,

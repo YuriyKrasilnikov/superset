@@ -43,6 +43,7 @@ export interface StreamingProgress {
   totalSize: number;
   status: ExportStatus;
   downloadUrl?: string;
+  savedDirectly?: boolean;
   error?: string;
   filename?: string;
   speed?: number;
@@ -268,6 +269,7 @@ const ModalStateContent = ({
 }: ModalStateContentProps) => {
   const theme = useTheme();
   const { downloadUrl, filename, error } = progress;
+  const { savedDirectly } = progress;
 
   const isError = status === ExportStatus.ERROR;
   const isCancelled = status === ExportStatus.CANCELLED;
@@ -318,14 +320,14 @@ const ModalStateContent = ({
         <CancelButton onClick={onCancel}>{buttonText}</CancelButton>
         {shouldShowRetry ? (
           <DownloadButton onClick={onRetry}>{t('Retry')}</DownloadButton>
-        ) : (
+        ) : !savedDirectly ? (
           <DownloadButton
             onClick={onDownload}
             disabled={!isCompleted || !downloadUrl}
           >
             {t('Download')}
           </DownloadButton>
-        )}
+        ) : null}
       </ActionButtons>
     </ModalContent>
   );
