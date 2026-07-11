@@ -104,7 +104,8 @@ def df_to_escaped_csv(df: pd.DataFrame, **kwargs: Any) -> Any:
                 if isinstance(value, str):
                     df.at[label, name] = escape_value(value)
 
-    return df.to_csv(escapechar="\\", **kwargs)
+    kwargs.setdefault("escapechar", "\\")
+    return df.to_csv(**kwargs)
 
 
 def get_chart_csv_data(

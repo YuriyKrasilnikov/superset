@@ -277,6 +277,20 @@ def test_df_to_escaped_csv_non_default_index():
     assert rows[2] == ["girl Mary", "safe"]
 
 
+def test_df_to_escaped_csv_honors_configured_escape_character() -> None:
+    """A configured escape character replaces, rather than duplicates, the default."""
+    dataframe = pd.DataFrame({"value": ['a"b']})
+
+    result = df_to_escaped_csv(
+        dataframe,
+        index=False,
+        doublequote=False,
+        escapechar="~",
+    )
+
+    assert result == 'value\na~"b\n'
+
+
 def test_get_chart_dataframe_returns_none_when_no_content(
     monkeypatch: pytest.MonkeyPatch,
 ):
