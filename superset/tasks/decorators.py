@@ -20,7 +20,16 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Any, Callable, cast, Generic, ParamSpec, TYPE_CHECKING, TypeVar
+from typing import (
+    Any,
+    Callable,
+    cast,
+    Generic,
+    overload,
+    ParamSpec,
+    TYPE_CHECKING,
+    TypeVar,
+)
 
 from superset_core.tasks.types import TaskOptions, TaskScope, TaskStatus
 
@@ -40,6 +49,26 @@ logger = logging.getLogger(__name__)
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
+
+@overload
+def task(
+    func: Callable[P, R],
+    *,
+    name: str | None = None,
+    scope: TaskScope = TaskScope.PRIVATE,
+    timeout: int | None = None,
+) -> TaskWrapper[P]: ...
+
+
+@overload
+def task(
+    func: None = None,
+    *,
+    name: str | None = None,
+    scope: TaskScope = TaskScope.PRIVATE,
+    timeout: int | None = None,
+) -> Callable[[Callable[P, R]], TaskWrapper[P]]: ...
 
 
 def task(
@@ -556,7 +585,18 @@ class TaskWrapper(Generic[P]):
             if final_task and final_task.status in TERMINAL_STATES:
                 TaskManager.publish_completion(task_uuid, final_task.status)
 
-    def schedule(self, *args: P.args, **kwargs: P.kwargs) -> "Task":
+    @overload
+    def schedule(self, *args: P.args, **kwargs: P.kwargs) -> Task: ...
+
+    @overload
+    def schedule(
+        self,
+        *args: Any,
+        options: TaskOptions | None = None,
+        **kwargs: Any,
+    ) -> Task: ...
+
+    def schedule(self, *args: Any, **kwargs: Any) -> Task:
         """
         Schedule this task for asynchronous execution.
 

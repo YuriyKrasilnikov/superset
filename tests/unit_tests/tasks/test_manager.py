@@ -20,9 +20,55 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
 import redis
+from superset_core.tasks.types import TaskScope, TaskStatus
 
 from superset.tasks.manager import AbortListener, TaskManager
+
+
+@patch.object(TaskManager, "publish_completion")
+@patch("superset.tasks.scheduler.execute_task")
+@patch("superset.commands.tasks.internal_update.InternalStatusTransitionCommand")
+@patch("superset.commands.tasks.submit.SubmitTaskCommand")
+def test_submit_task_marks_broker_enqueue_failure_terminal(
+    submit_command: MagicMock,
+    transition_command: MagicMock,
+    execute_task: MagicMock,
+    publish_completion: MagicMock,
+) -> None:
+    task = MagicMock(
+        uuid="b8b61b7b-1cd3-4a31-a74a-0a95341afc06",
+        properties_dict={"execution_mode": "async"},
+    )
+    submit_command.return_value.run_with_info.return_value = (task, True)
+    execute_task.delay.side_effect = RuntimeError("broker unavailable")
+    transition_command.return_value.run.return_value = True
+
+    with pytest.raises(RuntimeError, match="broker unavailable"):
+        TaskManager.submit_task(
+            task_type="test.task",
+            task_key=None,
+            task_name="Test task",
+            scope=TaskScope.PRIVATE,
+            timeout=None,
+            args=(1,),
+            kwargs={},
+        )
+
+    transition_command.assert_called_once_with(
+        task_uuid=task.uuid,
+        new_status=TaskStatus.FAILURE,
+        expected_status=TaskStatus.PENDING,
+        properties={
+            "execution_mode": "async",
+            "error_message": "broker unavailable",
+            "exception_type": "RuntimeError",
+        },
+        set_ended_at=True,
+    )
+    transition_command.return_value.run.assert_called_once_with()
+    publish_completion.assert_called_once_with(task.uuid, TaskStatus.FAILURE.value)
 
 
 class TestAbortListener:
@@ -211,6 +257,25 @@ class TestTaskManagerListenForAbort:
 
             # Should use polling since no Redis
             assert listener._pubsub is None
+
+    @patch("superset.tasks.manager.cache_manager")
+    def test_listen_for_abort_without_pubsub_uses_polling(self, mock_cache_manager):
+        """A configured backend without pub/sub still supports cancellation."""
+        mock_cache = MagicMock()
+        mock_cache.pubsub.return_value = None
+        mock_cache_manager.distributed_coordination = mock_cache
+
+        with patch.object(TaskManager, "_poll_for_abort", return_value=None):
+            listener = TaskManager.listen_for_abort(
+                task_uuid="test-uuid",
+                callback=MagicMock(),
+                poll_interval=1.0,
+                app=None,
+            )
+            time.sleep(0.1)
+            listener.stop()
+
+        assert listener._pubsub is None
 
     @patch("superset.tasks.manager.cache_manager")
     def test_listen_for_abort_with_redis_uses_pubsub(self, mock_cache_manager):

@@ -25,7 +25,7 @@ from typing import Any, Callable, TYPE_CHECKING
 from uuid import UUID
 
 import redis
-from superset_core.tasks.types import TaskProperties, TaskScope
+from superset_core.tasks.types import TaskProperties, TaskScope, TaskStatus
 
 from superset.async_events.cache_backend import (
     RedisCacheBackend,
@@ -417,9 +417,11 @@ class TaskManager:
         pubsub: redis.client.PubSub | None = None
         uuid_str = str(task_uuid)
 
-        # Use Redis pub/sub if configured
-        if (cache := cls._get_cache()) is not None:
-            pubsub = cache.pubsub()
+        cache = cls._get_cache()
+        pubsub = cache.pubsub() if cache is not None else None
+
+        # Use Redis pub/sub only when the configured backend provides it.
+        if pubsub is not None:
             channel = cls.get_abort_channel(task_uuid)
             pubsub.subscribe(channel)
             logger.debug("Subscribed to abort channel: %s", channel)
@@ -433,8 +435,7 @@ class TaskManager:
             )
             logger.debug("Started pub/sub abort listener for task %s", task_uuid)
         else:
-            # Use polling when Redis is not configured
-            pubsub = None
+            # Use polling when distributed pub/sub is unavailable.
             thread = threading.Thread(
                 target=cls._poll_for_abort,
                 args=(task_uuid, callback, stop_event, poll_interval, app),
@@ -736,15 +737,48 @@ class TaskManager:
         # Deduplicated tasks are already pending or running
         if is_new:
             # Import here to avoid circular dependency
+            from superset.commands.tasks.internal_update import (
+                InternalStatusTransitionCommand,
+            )
             from superset.tasks.scheduler import execute_task
 
             # Schedule Celery task for async execution
-            execute_task.delay(
-                task_uuid=str(task.uuid),
-                task_type=task_type,
-                args=args,
-                kwargs=kwargs,
-            )
+            try:
+                execute_task.delay(
+                    task_uuid=str(task.uuid),
+                    task_type=task_type,
+                    args=args,
+                    kwargs=kwargs,
+                )
+            except Exception as ex:
+                transitioned = InternalStatusTransitionCommand(
+                    task_uuid=task.uuid,
+                    new_status=TaskStatus.FAILURE,
+                    expected_status=TaskStatus.PENDING,
+                    properties={
+                        **task.properties_dict,
+                        "error_message": str(ex),
+                        "exception_type": type(ex).__name__,
+                    },
+                    set_ended_at=True,
+                ).run()
+                if transitioned:
+                    try:
+                        TaskManager.publish_completion(
+                            task.uuid,
+                            TaskStatus.FAILURE.value,
+                        )
+                    except Exception:  # pylint: disable=broad-except
+                        logger.exception(
+                            "Failed to publish enqueue failure for task %s",
+                            task.uuid,
+                        )
+                logger.exception(
+                    "Failed to enqueue task %s (uuid=%s)",
+                    task_type,
+                    task.uuid,
+                )
+                raise
 
             logger.debug(
                 "Scheduled task %s (uuid=%s) for async execution",

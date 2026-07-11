@@ -21,6 +21,7 @@ import threading
 import time
 import traceback
 from typing import Any, Callable, cast, TYPE_CHECKING, TypeVar
+from uuid import UUID
 
 from flask import current_app
 from superset_core.tasks.types import (
@@ -600,6 +601,11 @@ class TaskContext(CoreTaskContext):
         if self._timeout_timer is not None:
             self._timeout_timer.cancel()
             self._timeout_timer = None
+
+    @property
+    def task_uuid(self) -> UUID:
+        """Return the immutable identifier of the task owning this context."""
+        return self._task_uuid
 
     @property
     def timeout_triggered(self) -> bool:
