@@ -1328,13 +1328,14 @@ test('writes directly to a prepared file-system target without creating a Blob U
   if (!target) {
     throw new Error('Expected a prepared export target');
   }
+  const preparedTarget = target;
   act(() => {
     result.current.startExport({
       url: '/api/v1/chart/data',
       payload: { datasource: { id: 1, type: 'table' }, queries: [] },
       exportType: 'csv',
       exportSource: 'chart',
-      target,
+      target: preparedTarget,
     });
   });
 

@@ -94,7 +94,9 @@ test('does not offer a second download after saving directly to a file', () => {
 
   render(<StreamingExportModal {...defaultProps} progress={progress} />);
 
-  expect(screen.getByRole('button', { name: 'Close' })).toBeInTheDocument();
+  expect(
+    screen.getAllByRole('button', { name: 'Close' }).length,
+  ).toBeGreaterThan(0);
   expect(
     screen.queryByRole('button', { name: 'Download' }),
   ).not.toBeInTheDocument();

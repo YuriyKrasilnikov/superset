@@ -202,8 +202,7 @@ export const useExploreAdditionalActionsMenu = (
   onOpenPropertiesModal: () => void,
   ownState: OwnStateWithClientView | undefined,
   dashboards:
-    | NonNullable<ExplorePageInitialData['metadata']>['dashboards']
-    | undefined,
+    NonNullable<ExplorePageInitialData['metadata']>['dashboards'] | undefined,
   showReportModal: () => void,
   setCurrentReportDeleting: Dispatch<SetStateAction<ReportObject | null>>,
   ...rest: MenuProps[]
@@ -416,6 +415,7 @@ export const useExploreAdditionalActionsMenu = (
       if (shouldUseStreaming && !exportTarget) {
         return null;
       }
+      const preparedTarget = exportTarget ?? undefined;
       await exportChart({
         formData: latestQueryFormData as QueryFormData,
         ownState,
@@ -431,7 +431,7 @@ export const useExploreAdditionalActionsMenu = (
                   filename,
                   expectedRows: actualRowCount,
                   exportType: exportParams.exportType as 'csv' | 'xlsx',
-                  target: exportTarget,
+                  target: preparedTarget,
                 });
               }
             }
