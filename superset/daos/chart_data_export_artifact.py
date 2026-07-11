@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import Sequence, TYPE_CHECKING
 from uuid import UUID
 
+from sqlalchemy import and_, or_
 from superset_core.tasks.types import TaskStatus
 
 from superset.daos.base import BaseDAO
@@ -73,10 +74,11 @@ class ChartDataExportArtifactDAO(BaseDAO[ChartDataExportArtifact]):
     @classmethod
     def find_stale_tasks_without_artifacts(
         cls,
+        pending_before: datetime,
         started_before: datetime,
         max_rows: int | None = None,
     ) -> list[Task]:
-        """Find active export tasks that never persisted a cleanup tombstone."""
+        """Find overdue export tasks that never persisted a cleanup tombstone."""
         from superset import db
         from superset.models.tasks import Task
 
@@ -88,16 +90,24 @@ class ChartDataExportArtifactDAO(BaseDAO[ChartDataExportArtifact]):
             )
             .filter(
                 Task.task_type == "chart_data.generate_export_artifact",
-                Task.status.in_(
-                    [
-                        TaskStatus.IN_PROGRESS.value,
-                        TaskStatus.ABORTING.value,
-                    ]
+                or_(
+                    and_(
+                        Task.status == TaskStatus.PENDING.value,
+                        Task.created_on <= pending_before,
+                    ),
+                    and_(
+                        Task.status.in_(
+                            [
+                                TaskStatus.IN_PROGRESS.value,
+                                TaskStatus.ABORTING.value,
+                            ]
+                        ),
+                        Task.started_at <= started_before,
+                    ),
                 ),
-                Task.started_at <= started_before,
                 ChartDataExportArtifact.id.is_(None),
             )
-            .order_by(Task.started_at.asc(), Task.id.asc())
+            .order_by(Task.created_on.asc(), Task.id.asc())
         )
         if max_rows is not None and max_rows > 0:
             query = query.limit(max_rows)

@@ -350,6 +350,10 @@ def apply_client_processing(  # noqa: C901
             # reports to avoid unwanted conversions
             # This allows users to control which values should be treated as null/NA
             na_values = current_app.config["REPORTS_CSV_NA_NAMES"]
+            if isinstance(data, bytes):
+                data = data.decode(
+                    current_app.config.get("CSV_EXPORT", {}).get("encoding", "utf-8")
+                )
             df = pd.read_csv(
                 StringIO(data),
                 keep_default_na=na_values is None,

@@ -16,15 +16,18 @@
 # under the License.
 """Tests for chart-data artifact task boundaries."""
 
+import zipfile
 from datetime import datetime, timezone
+from typing import BinaryIO, cast
 from unittest.mock import call, MagicMock
 
 import pytest
+from flask import current_app
 from pytest_mock import MockerFixture
-from superset_core.tasks.types import TaskStatus
 
 from superset.common.chart_data import ChartDataResultFormat, ChartDataResultType
 from superset.tasks.chart_data_exports import (
+    _materialize_export,
     generate_chart_data_export_artifact,
     serialize_query_context_for_artifact,
 )
@@ -50,6 +53,45 @@ def test_serialize_query_context_for_artifact_is_json_safe() -> None:
     assert payload["result_type"] == "full"
     assert payload["custom_cache_timeout"] == 30
     assert payload["force"] is True
+
+
+def test_materialize_multi_query_export_spools_zip_to_file(
+    app_context: None,
+    mocker: MockerFixture,
+) -> None:
+    query_context = MagicMock(
+        result_format=ChartDataResultFormat.CSV,
+        result_type=ChartDataResultType.FULL,
+    )
+    mocker.patch(
+        "superset.tasks.chart_data_exports.ChartDataQueryContextSchema"
+    ).return_value.load.return_value = query_context
+    command = mocker.patch(
+        "superset.tasks.chart_data_exports.ChartDataCommand"
+    ).return_value
+    command.execute.return_value.materialize.return_value = {
+        "queries": [
+            {"data": b"a\n1\n"},
+            {"data": "b\n2\n"},
+        ]
+    }
+
+    content, content_type = _materialize_export(
+        {"result_format": "csv", "result_type": "full"}
+    )
+
+    assert content_type == "application/zip"
+    assert not isinstance(content, bytes)
+    archive = cast(BinaryIO, content)
+    try:
+        with zipfile.ZipFile(archive) as zip_file:
+            assert zip_file.namelist() == ["query_1.csv", "query_2.csv"]
+            assert zip_file.read("query_1.csv") == b"a\n1\n"
+            assert zip_file.read("query_2.csv") == "b\n2\n".encode(
+                current_app.config["CSV_EXPORT"].get("encoding", "utf-8")
+            )
+    finally:
+        archive.close()
 
 
 def test_artifact_task_rejects_mismatched_task_owner(
@@ -121,6 +163,7 @@ def test_artifact_task_persists_cleanup_key_before_storage_write(
     task_record = MagicMock(id=19, user_id=7)
     events: list[str] = []
     store = MagicMock()
+    content = MagicMock()
 
     def fail_write(_key: str, _chunks: object) -> int:
         events.append("write")
@@ -143,7 +186,7 @@ def test_artifact_task_persists_cleanup_key_before_storage_write(
     mocker.patch("superset.tasks.chart_data_exports.override_user")
     mocker.patch(
         "superset.tasks.chart_data_exports._materialize_export",
-        return_value=(b"a,b\n1,2\n", "text/csv"),
+        return_value=(content, "text/csv"),
     )
     create = mocker.patch(
         "superset.tasks.chart_data_exports.ChartDataExportArtifactDAO.create",
@@ -160,6 +203,7 @@ def test_artifact_task_persists_cleanup_key_before_storage_write(
 
     assert events == ["metadata", "write"]
     create.assert_called_once()
+    content.close.assert_called_once_with()
 
 
 def test_artifact_task_persists_tombstone_before_materialization(
@@ -282,10 +326,6 @@ def test_artifact_task_cleanup_keeps_successful_artifact(
         return_value=task_record,
     )
     mocker.patch(
-        "superset.tasks.chart_data_exports.TaskDAO.get_status",
-        return_value=TaskStatus.SUCCESS.value,
-    )
-    mocker.patch(
         "superset.tasks.chart_data_exports.security_manager.get_user_by_id",
         return_value=MagicMock(id=7),
     )
@@ -314,6 +354,54 @@ def test_artifact_task_cleanup_keeps_successful_artifact(
 
     find_artifact.assert_not_called()
     store.delete.assert_not_called()
+
+
+def test_artifact_task_cleanup_removes_completed_artifact_after_claimed_abort(
+    app_context: None,
+    mocker: MockerFixture,
+) -> None:
+    context = MagicMock(task_uuid="b8b61b7b-1cd3-4a31-a74a-0a95341afc06")
+    task_record = MagicMock(id=19, user_id=7)
+    stored_artifact = MagicMock()
+    store = MagicMock()
+    store.write.side_effect = lambda _key, chunks: sum(len(chunk) for chunk in chunks)
+    mocker.patch("superset.tasks.chart_data_exports.get_context", return_value=context)
+    mocker.patch(
+        "superset.tasks.chart_data_exports.TaskDAO.find_one_or_none",
+        return_value=task_record,
+    )
+    mocker.patch(
+        "superset.tasks.chart_data_exports.security_manager.get_user_by_id",
+        return_value=MagicMock(id=7),
+    )
+    mocker.patch(
+        "superset.tasks.chart_data_exports.get_chart_data_artifact_store",
+        return_value=store,
+    )
+    mocker.patch("superset.tasks.chart_data_exports.override_user")
+    mocker.patch(
+        "superset.tasks.chart_data_exports._materialize_export",
+        return_value=(b"a,b\n1,2\n", "text/csv"),
+    )
+    mocker.patch("superset.tasks.chart_data_exports.ChartDataExportArtifactDAO.create")
+    mocker.patch(
+        "superset.tasks.chart_data_exports.ChartDataExportArtifactDAO.find_by_task_id",
+        return_value=stored_artifact,
+    )
+    delete_artifact = mocker.patch(
+        "superset.tasks.chart_data_exports."
+        "delete_chart_data_export_artifact_transactionally"
+    )
+
+    generate_chart_data_export_artifact.func(
+        {"datasource": {"id": 7, "type": "table"}},
+        7,
+        "export.csv",
+    )
+    context.on_abort.call_args.args[0]()
+    context.on_cleanup.call_args.args[0]()
+
+    delete_artifact.assert_called_once_with(stored_artifact)
 
 
 def test_artifact_task_bounds_persisted_filename(
@@ -356,3 +444,49 @@ def test_artifact_task_bounds_persisted_filename(
     artifact = create.call_args.kwargs["item"]
     assert len(artifact.filename) == 255
     assert artifact.filename.endswith(".csv")
+
+
+def test_artifact_task_cooperatively_stops_after_abort(
+    app_context: None,
+    mocker: MockerFixture,
+) -> None:
+    context = MagicMock(task_uuid="b8b61b7b-1cd3-4a31-a74a-0a95341afc06")
+    task_record = MagicMock(id=19, user_id=7)
+    store = MagicMock()
+    mocker.patch("superset.tasks.chart_data_exports.get_context", return_value=context)
+    mocker.patch(
+        "superset.tasks.chart_data_exports.TaskDAO.find_one_or_none",
+        return_value=task_record,
+    )
+    mocker.patch(
+        "superset.tasks.chart_data_exports.security_manager.get_user_by_id",
+        return_value=MagicMock(id=7),
+    )
+    mocker.patch(
+        "superset.tasks.chart_data_exports.get_chart_data_artifact_store",
+        return_value=store,
+    )
+    mocker.patch("superset.tasks.chart_data_exports.override_user")
+
+    def abort_during_materialization(_payload: dict[str, object]) -> tuple[bytes, str]:
+        context.on_abort.call_args.args[0]()
+        return b"a,b\n1,2\n", "text/csv"
+
+    mocker.patch(
+        "superset.tasks.chart_data_exports._materialize_export",
+        side_effect=abort_during_materialization,
+    )
+    mocker.patch("superset.tasks.chart_data_exports.ChartDataExportArtifactDAO.create")
+    finalize = mocker.patch(
+        "superset.tasks.chart_data_exports._finalize_artifact_metadata"
+    )
+
+    generate_chart_data_export_artifact.func(
+        {"datasource": {"id": 7, "type": "table"}},
+        7,
+        "export.csv",
+    )
+
+    store.write.assert_not_called()
+    finalize.assert_not_called()
+    context.update_task.assert_not_called()

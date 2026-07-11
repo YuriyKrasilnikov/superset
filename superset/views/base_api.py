@@ -211,6 +211,10 @@ class BaseSupersetApiMixin:
             "content": error_payload_content,
         },
         "500": {"description": "Fatal error", "content": error_payload_content},
+        "503": {
+            "description": "Service unavailable",
+            "content": error_payload_content,
+        },
     }
 
     def incr_stats(self, action: str, func_name: str) -> None:

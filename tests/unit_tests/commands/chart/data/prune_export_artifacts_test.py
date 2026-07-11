@@ -172,7 +172,8 @@ def test_prune_export_artifacts_recovers_stale_task_without_tombstone(
     app_context: None,
     mocker: MockerFixture,
 ) -> None:
-    now = datetime(2026, 7, 10, 12, 0)
+    utc_now = datetime(2026, 7, 10, 12, 0)
+    local_now = datetime(2026, 7, 10, 15, 0)
     task = MagicMock(
         uuid=uuid4(),
         status=TaskStatus.IN_PROGRESS.value,
@@ -181,7 +182,9 @@ def test_prune_export_artifacts_recovers_stale_task_without_tombstone(
     mock_datetime = mocker.patch(
         "superset.commands.chart.data.prune_export_artifacts.datetime"
     )
-    mock_datetime.now.return_value = now
+    mock_datetime.now.side_effect = (
+        lambda timezone_value=None: utc_now if timezone_value else local_now
+    )
     mock_current_app = mocker.patch(
         "superset.commands.chart.data.prune_export_artifacts.current_app"
     )
@@ -210,9 +213,49 @@ def test_prune_export_artifacts_recovers_stale_task_without_tombstone(
 
     assert count == 0
     find_stale.assert_called_once()
-    started_before = find_stale.call_args.args[0]
-    assert started_before == now - timedelta(
+    pending_before = find_stale.call_args.args[0]
+    started_before = find_stale.call_args.args[1]
+    assert pending_before == local_now - timedelta(
         seconds=60 * 60,
     )
-    assert find_stale.call_args.args[1] is None
+    assert started_before == utc_now - timedelta(
+        seconds=60 * 60,
+    )
+    assert find_stale.call_args.args[2] is None
+    publish_completion.assert_called_once_with(task.uuid, TaskStatus.FAILURE.value)
+
+
+def test_prune_export_artifacts_recovers_stale_pending_task(
+    app_context: None,
+    mocker: MockerFixture,
+) -> None:
+    task = MagicMock(
+        uuid=uuid4(),
+        status=TaskStatus.PENDING.value,
+        properties_dict={"execution_mode": "async"},
+    )
+    mocker.patch(
+        "superset.commands.chart.data.prune_export_artifacts."
+        "ChartDataExportArtifactDAO.find_expired",
+        return_value=[],
+    )
+    mocker.patch(
+        "superset.commands.chart.data.prune_export_artifacts."
+        "ChartDataExportArtifactDAO.find_stale_tasks_without_artifacts",
+        return_value=[task],
+    )
+    transition = mocker.patch(
+        "superset.commands.chart.data.prune_export_artifacts."
+        "InternalStatusTransitionCommand"
+    )
+    transition.return_value.run.return_value = True
+    publish_completion = mocker.patch(
+        "superset.commands.chart.data.prune_export_artifacts."
+        "TaskManager.publish_completion"
+    )
+
+    ChartDataExportArtifactPruneCommand().run()
+
+    transition.assert_called_once()
+    assert TaskStatus.PENDING in transition.call_args.kwargs["expected_status"]
     publish_completion.assert_called_once_with(task.uuid, TaskStatus.FAILURE.value)

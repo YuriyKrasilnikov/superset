@@ -1971,7 +1971,14 @@ def test_apply_client_processing_json_format():
     }
 
 
-def test_apply_client_processing_csv_format():
+@pytest.mark.parametrize(
+    "data",
+    [
+        "\nCOUNT(is_software_dev)\n4725\n",
+        b"\nCOUNT(is_software_dev)\n4725\n",
+    ],
+)
+def test_apply_client_processing_csv_format(data: str | bytes):
     """
     It should be able to process csv results
     """
@@ -1980,10 +1987,7 @@ def test_apply_client_processing_csv_format():
         "queries": [
             {
                 "result_format": ChartDataResultFormat.CSV,
-                "data": """
-COUNT(is_software_dev)
-4725
-""",
+                "data": data,
             }
         ]
     }

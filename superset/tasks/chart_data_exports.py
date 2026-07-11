@@ -19,14 +19,16 @@
 from __future__ import annotations
 
 import hashlib
+import tempfile
 import threading
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, BinaryIO, Iterable
 from uuid import uuid4
 
 from flask import current_app, g
-from superset_core.tasks.types import TaskScope, TaskStatus
+from superset_core.tasks.types import TaskScope
 from werkzeug.utils import secure_filename
 
 from superset import security_manager
@@ -44,7 +46,7 @@ from superset.models.chart_data_export_artifact import ChartDataExportArtifact
 from superset.tasks.ambient_context import get_context
 from superset.tasks.decorators import task
 from superset.utils import json
-from superset.utils.core import create_zip, override_user
+from superset.utils.core import override_user
 from superset.utils.decorators import transaction
 
 _WRITE_CHUNK_SIZE = 1024 * 1024
@@ -70,7 +72,7 @@ def serialize_query_context_for_artifact(query_context: Any) -> dict[str, Any]:
     return json.loads(json.dumps(payload, default=json.json_iso_dttm_ser))
 
 
-def _materialize_export(payload: dict[str, Any]) -> tuple[bytes, str]:
+def _materialize_export(payload: dict[str, Any]) -> tuple[bytes | BinaryIO, str]:
     query_context = ChartDataQueryContextSchema().load(payload)
     if query_context.result_format != ChartDataResultFormat.CSV:
         raise ValueError("Chart-data artifacts support CSV exports only")
@@ -95,22 +97,43 @@ def _materialize_export(payload: dict[str, Any]) -> tuple[bytes, str]:
 
     if len(queries) == 1:
         return as_bytes(queries[0]["data"]), "text/csv"
-    files = {
-        f"query_{index + 1}.csv": as_bytes(query["data"])
-        for index, query in enumerate(queries)
-    }
-    return create_zip(files).getvalue(), "application/zip"
+
+    archive = tempfile.TemporaryFile(mode="w+b")
+    try:
+        with zipfile.ZipFile(
+            archive,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as zip_file:
+            for index, query in enumerate(queries):
+                zip_file.writestr(
+                    f"query_{index + 1}.csv",
+                    as_bytes(query["data"]),
+                )
+                query["data"] = None
+        archive.seek(0)
+        return archive, "application/zip"
+    except BaseException:
+        archive.close()
+        raise
 
 
 def _tracked_chunks(
-    content: bytes,
+    content: bytes | BinaryIO,
     digest: Any,
     aborted: threading.Event,
 ) -> Iterable[bytes]:
-    for offset in range(0, len(content), _WRITE_CHUNK_SIZE):
+    chunks: Iterable[bytes]
+    if isinstance(content, bytes):
+        chunks = (
+            content[offset : offset + _WRITE_CHUNK_SIZE]
+            for offset in range(0, len(content), _WRITE_CHUNK_SIZE)
+        )
+    else:
+        chunks = iter(lambda: content.read(_WRITE_CHUNK_SIZE), b"")
+    for chunk in chunks:
         if aborted.is_set():
-            raise RuntimeError("Chart-data export was cancelled")
-        chunk = content[offset : offset + _WRITE_CHUNK_SIZE]
+            return
         digest.update(chunk)
         yield chunk
 
@@ -171,6 +194,7 @@ def generate_chart_data_export_artifact(
     store = get_chart_data_artifact_store()
     storage_key = str(uuid4())
     aborted = threading.Event()
+    artifact_complete = threading.Event()
 
     @context.on_abort
     def abort_export() -> None:
@@ -178,10 +202,9 @@ def generate_chart_data_export_artifact(
 
     @context.on_cleanup
     def cleanup_incomplete_export() -> None:
-        # Status transitions use bulk updates with synchronize_session=False.
-        # Read the scalar status so an identity-mapped IN_PROGRESS Task cannot
-        # make cleanup remove an artifact after a successful transition.
-        if TaskDAO.get_status(context.task_uuid) == TaskStatus.SUCCESS.value:
+        # Terminal task state is published only after cleanup. Preserve the object
+        # only when every artifact phase completed and no cancellation was claimed.
+        if artifact_complete.is_set() and not aborted.is_set():
             return
         artifact = ChartDataExportArtifactDAO.find_by_task_id(task_record.id)
         if artifact is not None:
@@ -207,15 +230,19 @@ def generate_chart_data_export_artifact(
 
     with override_user(user):
         content, content_type = _materialize_export(payload)
-    if aborted.is_set():
-        raise RuntimeError("Chart-data export was cancelled")
+    try:
+        if aborted.is_set():
+            return
 
-    extension = ".zip" if content_type == "application/zip" else ".csv"
-    artifact_filename = _artifact_filename(filename, extension)
-    digest = hashlib.sha256()
-    size = store.write(storage_key, _tracked_chunks(content, digest, aborted))
-    if aborted.is_set():
-        raise RuntimeError("Chart-data export was cancelled")
+        extension = ".zip" if content_type == "application/zip" else ".csv"
+        artifact_filename = _artifact_filename(filename, extension)
+        digest = hashlib.sha256()
+        size = store.write(storage_key, _tracked_chunks(content, digest, aborted))
+        if aborted.is_set():
+            return
+    finally:
+        if not isinstance(content, bytes):
+            content.close()
     expires_at = _artifact_expiration()
     _finalize_artifact_metadata(
         artifact,
@@ -236,3 +263,4 @@ def generate_chart_data_export_artifact(
             "size_bytes": size,
         },
     )
+    artifact_complete.set()

@@ -110,10 +110,13 @@ class ChartDataExportArtifactPruneCommand(BaseCommand):
         if self._max_rows_per_run is not None and self._max_rows_per_run > 0:
             remaining_rows = max(self._max_rows_per_run - len(artifacts), 0)
         if remaining_rows != 0:
-            started_before = expires_before - timedelta(
+            artifact_ttl = timedelta(
                 seconds=current_app.config["CHART_DATA_ARTIFACT_TTL_SECONDS"]
             )
+            pending_before = datetime.now() - artifact_ttl
+            started_before = expires_before - artifact_ttl
             stale_tasks = ChartDataExportArtifactDAO.find_stale_tasks_without_artifacts(
+                pending_before,
                 started_before,
                 remaining_rows,
             )
