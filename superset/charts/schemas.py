@@ -1800,6 +1800,25 @@ class ChartDataAsyncResponseSchema(Schema):
     )
 
 
+class ChartDataArtifactAsyncResponseSchema(Schema):
+    task_uuid = fields.UUID(
+        metadata={"description": "Private export task identifier"},
+        allow_none=False,
+    )
+    status = fields.String(
+        metadata={"description": "Initial export task status"},
+        allow_none=False,
+    )
+    status_url = fields.String(
+        metadata={"description": "URL for polling export task status"},
+        allow_none=False,
+    )
+    artifact_url = fields.String(
+        metadata={"description": "URL for downloading the completed artifact"},
+        allow_none=False,
+    )
+
+
 class ChartFavStarResponseResult(Schema):
     id = fields.Integer(metadata={"description": "The Chart id"})
     value = fields.Boolean(metadata={"description": "The FaveStar value"})
@@ -1919,6 +1938,7 @@ CHART_SCHEMAS = (
     DashboardFiltersResponseSchema,
     ChartDataResponseSchema,
     ChartDataAsyncResponseSchema,
+    ChartDataArtifactAsyncResponseSchema,
     # TODO: These should optimally be included in the QueryContext schema as an `anyOf`
     #  in ChartDataPostProcessingOperation.options, but since `anyOf` is not
     #  by Marshmallow<3, this is not currently possible.

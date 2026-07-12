@@ -567,6 +567,45 @@ SUPERSET_DASHBOARD_POSITION_DATA_LIMIT = 131072  # double the default
 
 Alternatively, split a very large dashboard into several smaller ones. Note that this check is enforced when saving layout edits in the UI; a dashboard imported from a ZIP with an oversized layout will load and render, but cannot be edited and re-saved until the limit is raised.
 
+## Large Chart CSV Exports
+
+Large chart CSV requests first attempt direct database-to-response streaming. This path is used only when the database engine explicitly supports server-side cursors and the query does not require dataframe transformations. Configure the row estimate that enters export planning with `CSV_STREAMING_ROW_THRESHOLD`.
+
+Non-direct exports can be materialized by a private Global Task Framework (GTF) task instead of the web worker. This feature is disabled by default and requires a durable artifact store shared by the web and Celery worker processes:
+
+```python
+from superset.charts.data.artifacts import FileSystemChartDataArtifactStore
+
+FEATURE_FLAGS = {
+    "GLOBAL_TASK_FRAMEWORK": True,
+    "CHART_DATA_ASYNC_EXPORTS": True,
+}
+
+CHART_DATA_ARTIFACT_STORE = FileSystemChartDataArtifactStore(
+    "/var/lib/superset/chart-data-artifacts"
+)
+CHART_DATA_ARTIFACT_TTL_SECONDS = 24 * 60 * 60
+CHART_DATA_ARTIFACT_RECOVERY_GRACE_SECONDS = 60
+```
+
+`FileSystemChartDataArtifactStore` is intended for deployments where every relevant process sees the same durable filesystem path. Distributed deployments should provide an object implementing `ChartDataArtifactStore` backed by shared object storage. Superset fails during startup when asynchronous exports are enabled without GTF, a valid store, or positive integer TTL and recovery-grace settings.
+
+Clients can request artifact delivery explicitly with `Prefer: respond-async`. The chart data endpoint also selects artifact delivery when an estimated large export is not eligible for direct streaming. A successful scheduling response uses HTTP 202 and includes private task status and artifact download URLs.
+
+The TTL bounds incomplete generation records and completed artifact retention. Recovery first requests cancellation from an active worker, then waits at least the configured grace interval before publishing a terminal recovery outcome.
+
+Schedule artifact pruning more frequently than the configured TTL:
+
+```python
+CELERY_CONFIG.beat_schedule["prune_chart_data_export_artifacts"] = {
+    "task": "prune_chart_data_export_artifacts",
+    "schedule": crontab(minute=0, hour="*"),
+    "kwargs": {"max_rows_per_run": 10000},
+}
+```
+
+Artifact downloads remain private to the initiating user and recheck export permission and datasource access. Custom roles using asynchronous exports also need `can_read` on `Task` for status and download endpoints, plus `can_write` on `Task` if users should be able to cancel active exports. Embedded guest exports do not use private GTF artifacts.
+
 :::resources
 - [Blog: Feature Flags in Apache Superset](https://preset.io/blog/feature-flags-in-apache-superset-and-preset/)
 :::

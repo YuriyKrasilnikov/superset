@@ -32,6 +32,8 @@ def _planner(
     *,
     result_format: ChartDataResultFormat = ChartDataResultFormat.CSV,
     optimize_requested: bool = False,
+    async_preferred: bool = False,
+    artifact_available: bool = False,
     direct_eligible: bool = False,
 ) -> tuple[ChartDataExportPlanner, MagicMock, MagicMock]:
     query_context = MagicMock(result_format=result_format)
@@ -45,11 +47,27 @@ def _planner(
         ChartDataExportPlanner(
             query_context,
             optimize_requested=optimize_requested,
+            async_preferred=async_preferred,
+            artifact_available=artifact_available,
             direct_command_factory=factory,
         ),
         command,
         factory,
     )
+
+
+def test_async_preference_uses_available_artifact_without_direct_planning() -> None:
+    planner, _, factory = _planner(
+        async_preferred=True,
+        artifact_available=True,
+        optimize_requested=True,
+    )
+
+    plan = planner.plan()
+
+    assert plan.mode == ChartDataExportMode.ARTIFACT
+    assert plan.preference_applied
+    factory.assert_not_called()
 
 
 def test_optimized_eligible_export_uses_direct_streaming() -> None:
@@ -63,23 +81,28 @@ def test_optimized_eligible_export_uses_direct_streaming() -> None:
     assert plan.mode == ChartDataExportMode.DIRECT
     assert plan.direct_command is command
     factory.assert_called_once_with()
-    command.prepare.assert_called_once_with()
 
 
-def test_ineligible_direct_export_falls_back_to_materialized() -> None:
-    planner, _, _ = _planner(optimize_requested=True)
+def test_ineligible_direct_export_falls_back_to_artifact() -> None:
+    planner, _, _ = _planner(
+        optimize_requested=True,
+        artifact_available=True,
+    )
 
     plan = planner.plan()
 
-    assert plan.mode == ChartDataExportMode.MATERIALIZED
+    assert plan.mode == ChartDataExportMode.ARTIFACT
     assert plan.direct_ineligibility == StreamingExportIneligibility.RESULT_TRANSFORM
+    assert not plan.preference_applied
 
 
 def test_unoptimized_or_non_csv_export_remains_materialized() -> None:
-    unoptimized, _, unoptimized_factory = _planner()
+    unoptimized, _, unoptimized_factory = _planner(artifact_available=True)
     non_csv, _, non_csv_factory = _planner(
         result_format=ChartDataResultFormat.JSON,
         optimize_requested=True,
+        async_preferred=True,
+        artifact_available=True,
     )
 
     assert unoptimized.plan().mode == ChartDataExportMode.MATERIALIZED

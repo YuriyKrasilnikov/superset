@@ -31,7 +31,9 @@ from flask import (
 )
 from flask_appbuilder.api import expose, protect
 from flask_babel import gettext as _
+from kombu.exceptions import OperationalError
 from marshmallow import ValidationError
+from superset_core.tasks.types import TaskOptions
 from werkzeug.utils import secure_filename
 
 from superset import is_feature_enabled, security_manager
@@ -83,6 +85,10 @@ from superset.exceptions import (
 )
 from superset.extensions import event_logger
 from superset.models.sql_lab import Query
+from superset.tasks.chart_data_exports import (
+    generate_chart_data_export_artifact,
+    serialize_query_context_for_artifact,
+)
 from superset.utils import json
 from superset.utils.core import (
     create_zip,
@@ -170,7 +176,9 @@ class ChartDataRestApi(ChartRestApi):
               content:
                 application/json:
                   schema:
-                    $ref: "#/components/schemas/ChartDataAsyncResponseSchema"
+                    oneOf:
+                    - $ref: "#/components/schemas/ChartDataAsyncResponseSchema"
+                    - $ref: "#/components/schemas/ChartDataArtifactAsyncResponseSchema"
             400:
               $ref: '#/components/responses/400'
             401:
@@ -181,6 +189,8 @@ class ChartDataRestApi(ChartRestApi):
               $ref: '#/components/responses/404'
             500:
               $ref: '#/components/responses/500'
+            503:
+              $ref: '#/components/responses/503'
         """
         chart = self.datamodel.get(pk, self._base_filters)
         if not chart:
@@ -328,7 +338,9 @@ class ChartDataRestApi(ChartRestApi):
               content:
                 application/json:
                   schema:
-                    $ref: "#/components/schemas/ChartDataAsyncResponseSchema"
+                    oneOf:
+                    - $ref: "#/components/schemas/ChartDataAsyncResponseSchema"
+                    - $ref: "#/components/schemas/ChartDataArtifactAsyncResponseSchema"
             400:
               $ref: '#/components/responses/400'
             401:
@@ -337,6 +349,8 @@ class ChartDataRestApi(ChartRestApi):
               $ref: '#/components/responses/403'
             500:
               $ref: '#/components/responses/500'
+            503:
+              $ref: '#/components/responses/503'
         """
         json_body = None
         if request.is_json:
@@ -622,21 +636,28 @@ class ChartDataRestApi(ChartRestApi):
         ):
             return self.response_403()
 
+        optimize_requested = self._should_attempt_direct_streaming(
+            query_context,
+            form_data,
+            expected_rows,
+        )
+        async_preferred = self._async_response_preferred()
+        artifact_available = (
+            is_feature_enabled("CHART_DATA_ASYNC_EXPORTS") and get_user_id() is not None
+        )
         try:
             plan = ChartDataExportPlanner(
                 query_context,
-                optimize_requested=self._should_attempt_direct_streaming(
-                    query_context,
-                    form_data,
-                    expected_rows,
-                ),
+                optimize_requested=optimize_requested,
+                async_preferred=async_preferred,
+                artifact_available=artifact_available,
                 direct_command_factory=lambda: StreamingCSVExportCommand(
                     query_context,
                     chunk_size=1024,
                 ),
             ).plan()
             if query_context.result_format == ChartDataResultFormat.CSV:
-                self._record_export_plan(plan)
+                self._record_export_plan(plan, async_preferred)
             if (
                 plan.mode == ChartDataExportMode.DIRECT
                 and plan.direct_command is not None
@@ -646,6 +667,13 @@ class ChartDataRestApi(ChartRestApi):
                     form_data,
                     filename=filename,
                     expected_rows=expected_rows,
+                )
+            if plan.mode == ChartDataExportMode.ARTIFACT:
+                return self._create_artifact_export_response(
+                    query_context,
+                    form_data,
+                    filename,
+                    preference_applied=plan.preference_applied,
                 )
         except SupersetSecurityException:
             return self.response_403()
@@ -765,7 +793,10 @@ class ChartDataRestApi(ChartRestApi):
         return row_estimate is not None and row_estimate >= threshold
 
     @staticmethod
-    def _record_export_plan(plan: ChartDataExportPlan) -> None:
+    def _record_export_plan(
+        plan: ChartDataExportPlan,
+        async_preferred: bool,
+    ) -> None:
         """Emit bounded transport diagnostics without query or user content."""
         stats_logger = app.config["STATS_LOGGER"]
         stats_logger.incr(f"chart_data.export.transport.{plan.mode.value}")
@@ -775,12 +806,22 @@ class ChartDataRestApi(ChartRestApi):
             else None
         )
         logger.info(
-            "Chart CSV export plan selected: mode=%s, direct_ineligibility=%s",
+            "Chart CSV export plan selected: mode=%s, "
+            "direct_ineligibility=%s, async_preferred=%s",
             plan.mode.value,
             ineligibility,
+            async_preferred,
         )
         if ineligibility is not None:
             stats_logger.incr(f"chart_data.export.direct_ineligible.{ineligibility}")
+
+    @staticmethod
+    def _async_response_preferred() -> bool:
+        """Return whether the request contains the RFC 7240 respond-async token."""
+        for preference in request.headers.get("Prefer", "").split(","):
+            if preference.strip().split(";", 1)[0].lower() == "respond-async":
+                return True
+        return False
 
     def _create_streaming_csv_response(
         self,
@@ -814,6 +855,8 @@ class ChartDataRestApi(ChartRestApi):
         command.validate()
 
         csv_generator = command.run()
+
+        # Get encoding from config
         encoding = app.config.get("CSV_EXPORT", {}).get("encoding", "utf-8")
 
         response = Response(
@@ -833,4 +876,51 @@ class ChartDataRestApi(ChartRestApi):
         # Force chunked transfer encoding
         response.implicit_sequence_conversion = False
 
+        return response
+
+    def _create_artifact_export_response(
+        self,
+        query_context: QueryContext,
+        form_data: dict[str, Any] | None,
+        filename: str | None,
+        *,
+        preference_applied: bool = False,
+    ) -> Response:
+        """Schedule a private GTF artifact for a non-direct large export."""
+        owner_id = get_user_id()
+        if owner_id is None:
+            return self.response_403()
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            chart_name = (form_data or {}).get("slice_name") or (form_data or {}).get(
+                "viz_type", "export"
+            )
+            filename = f"superset_{chart_name}_{timestamp}.csv"
+        filename = secure_filename(filename) or "export.csv"
+        try:
+            task = generate_chart_data_export_artifact.schedule(
+                serialize_query_context_for_artifact(query_context),
+                owner_id,
+                filename,
+                options=TaskOptions(
+                    task_name=f"Export {filename}"[:256],
+                    timeout=app.config["CHART_DATA_ARTIFACT_TTL_SECONDS"],
+                ),
+            )
+        except OperationalError:
+            logger.exception("Chart-data export could not be enqueued")
+            return self.response(
+                503,
+                message=_("The export service is temporarily unavailable"),
+            )
+        task_uuid = str(task.uuid)
+        response = self.response(
+            202,
+            task_uuid=task_uuid,
+            status="pending",
+            status_url=f"/api/v1/task/{task_uuid}/status",
+            artifact_url=f"/api/v1/task/{task_uuid}/artifact",
+        )
+        if preference_applied:
+            response.headers["Preference-Applied"] = "respond-async"
         return response

@@ -38,6 +38,7 @@ class ChartDataExportMode(str, Enum):
 
     MATERIALIZED = "materialized"
     DIRECT = "direct"
+    ARTIFACT = "artifact"
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class ChartDataExportPlan:
     mode: ChartDataExportMode
     direct_command: StreamingCSVExportCommand | None = None
     direct_ineligibility: StreamingExportIneligibility | None = None
+    preference_applied: bool = False
 
 
 class ChartDataExportPlanner:
@@ -57,18 +59,28 @@ class ChartDataExportPlanner:
         query_context: QueryContext,
         *,
         optimize_requested: bool,
+        async_preferred: bool,
+        artifact_available: bool,
         direct_command_factory: Callable[[], StreamingCSVExportCommand],
     ) -> None:
         self._query_context = query_context
         self._optimize_requested = optimize_requested
+        self._async_preferred = async_preferred
+        self._artifact_available = artifact_available
         self._direct_command_factory = direct_command_factory
 
     def plan(self) -> ChartDataExportPlan:
         """Return a deterministic plan from request intent and capabilities."""
-        if (
-            self._query_context.result_format != ChartDataResultFormat.CSV
-            or not self._optimize_requested
-        ):
+        if self._query_context.result_format != ChartDataResultFormat.CSV:
+            return ChartDataExportPlan(ChartDataExportMode.MATERIALIZED)
+
+        if self._async_preferred and self._artifact_available:
+            return ChartDataExportPlan(
+                ChartDataExportMode.ARTIFACT,
+                preference_applied=True,
+            )
+
+        if not self._optimize_requested:
             return ChartDataExportPlan(ChartDataExportMode.MATERIALIZED)
 
         direct_command = self._direct_command_factory()
@@ -77,6 +89,11 @@ class ChartDataExportPlanner:
             return ChartDataExportPlan(
                 ChartDataExportMode.DIRECT,
                 direct_command=direct_command,
+            )
+        if self._artifact_available:
+            return ChartDataExportPlan(
+                ChartDataExportMode.ARTIFACT,
+                direct_ineligibility=preparation.ineligibility,
             )
         return ChartDataExportPlan(
             ChartDataExportMode.MATERIALIZED,

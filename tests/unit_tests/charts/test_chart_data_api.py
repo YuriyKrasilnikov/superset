@@ -22,6 +22,7 @@ from typing import Any, TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
 from flask import Flask, g, has_request_context, request, Response
+from kombu.exceptions import OperationalError
 from pytest_mock import MockerFixture
 
 from superset.charts.data.api import ChartDataRestApi
@@ -416,8 +417,6 @@ def test_ineligible_direct_export_materializes_once(
         StreamingExportIneligibility.RESULT_TRANSFORM
     )
     expected_response = Response("materialized")
-    stats_logger = MagicMock()
-    mocker.patch.dict(app.config, {"STATS_LOGGER": stats_logger})
     mocker.patch.object(api, "_can_export_data", return_value=True)
     mocker.patch.object(api, "_should_attempt_direct_streaming", return_value=True)
     send_response = mocker.patch.object(
@@ -430,7 +429,191 @@ def test_ineligible_direct_export_materializes_once(
     assert response is expected_response
     command.execute.assert_called_once()
     send_response.assert_called_once()
+
+
+def test_ineligible_direct_export_schedules_artifact_without_materializing(
+    app: SupersetApp,
+    mocker: MockerFixture,
+) -> None:
+    """An enabled authenticated fallback leaves materialization to GTF."""
+    api = ChartDataRestApi.__new__(ChartDataRestApi)
+    command = MagicMock()
+    command.query_context.result_format = ChartDataResultFormat.CSV
+    stream_command = mocker.patch(
+        "superset.charts.data.api.StreamingCSVExportCommand"
+    ).return_value
+    stream_command.prepare.return_value.eligible = False
+    stream_command.prepare.return_value.ineligibility = (
+        StreamingExportIneligibility.RESULT_TRANSFORM
+    )
+    expected_response = Response("accepted", status=202)
+    stats_logger = MagicMock()
+    mocker.patch.dict(app.config, {"STATS_LOGGER": stats_logger})
+    mocker.patch.object(api, "_can_export_data", return_value=True)
+    mocker.patch.object(api, "_should_attempt_direct_streaming", return_value=True)
+    mocker.patch(
+        "superset.charts.data.api.is_feature_enabled",
+        side_effect=lambda flag: flag == "CHART_DATA_ASYNC_EXPORTS",
+    )
+    mocker.patch("superset.charts.data.api.get_user_id", return_value=7)
+    create_artifact = mocker.patch.object(
+        api,
+        "_create_artifact_export_response",
+        return_value=expected_response,
+    )
+
+    with app.test_request_context("/api/v1/chart/data", method="POST"):
+        response = api._get_data_response(command, expected_rows=100_000)
+
+    assert response is expected_response
+    command.execute.assert_not_called()
     assert stats_logger.incr.call_args_list == [
-        mocker.call("chart_data.export.transport.materialized"),
+        mocker.call("chart_data.export.transport.artifact"),
         mocker.call("chart_data.export.direct_ineligible.result_transform"),
     ]
+    create_artifact.assert_called_once_with(
+        command.query_context,
+        None,
+        None,
+        preference_applied=False,
+    )
+
+
+def test_guest_ineligible_direct_export_keeps_synchronous_fallback(
+    app: SupersetApp,
+    mocker: MockerFixture,
+) -> None:
+    """GTF artifacts do not weaken or redefine embedded guest ownership."""
+    api = ChartDataRestApi.__new__(ChartDataRestApi)
+    command = MagicMock()
+    command.query_context.result_format = ChartDataResultFormat.CSV
+    stream_command = mocker.patch(
+        "superset.charts.data.api.StreamingCSVExportCommand"
+    ).return_value
+    stream_command.prepare.return_value.eligible = False
+    stream_command.prepare.return_value.ineligibility = (
+        StreamingExportIneligibility.RESULT_TRANSFORM
+    )
+    expected_response = Response("materialized")
+    mocker.patch.object(api, "_can_export_data", return_value=True)
+    mocker.patch.object(api, "_should_attempt_direct_streaming", return_value=True)
+    mocker.patch(
+        "superset.charts.data.api.is_feature_enabled",
+        side_effect=lambda flag: flag == "CHART_DATA_ASYNC_EXPORTS",
+    )
+    mocker.patch("superset.charts.data.api.get_user_id", return_value=None)
+    create_artifact = mocker.patch.object(api, "_create_artifact_export_response")
+    mocker.patch.object(
+        api,
+        "_send_chart_response",
+        return_value=expected_response,
+    )
+
+    with app.test_request_context("/api/v1/chart/data", method="POST"):
+        response = api._get_data_response(command, expected_rows=100_000)
+
+    assert response is expected_response
+    command.execute.assert_called_once()
+    create_artifact.assert_not_called()
+
+
+def test_respond_async_preference_skips_direct_planning(
+    app: SupersetApp,
+    mocker: MockerFixture,
+) -> None:
+    """An authenticated CSV request can explicitly select artifact delivery."""
+    api = ChartDataRestApi.__new__(ChartDataRestApi)
+    command = MagicMock()
+    command.query_context.result_format = ChartDataResultFormat.CSV
+    expected_response = Response("accepted", status=202)
+    mocker.patch.object(api, "_can_export_data", return_value=True)
+    mocker.patch.object(api, "_should_attempt_direct_streaming", return_value=False)
+    mocker.patch(
+        "superset.charts.data.api.is_feature_enabled",
+        side_effect=lambda flag: flag == "CHART_DATA_ASYNC_EXPORTS",
+    )
+    mocker.patch("superset.charts.data.api.get_user_id", return_value=7)
+    direct_command = mocker.patch("superset.charts.data.api.StreamingCSVExportCommand")
+    create_artifact = mocker.patch.object(
+        api,
+        "_create_artifact_export_response",
+        return_value=expected_response,
+    )
+
+    with app.test_request_context(
+        "/api/v1/chart/data",
+        method="POST",
+        headers={"Prefer": "wait=10, Respond-Async; handling=strict"},
+    ):
+        response = api._get_data_response(command, expected_rows=10)
+
+    assert response is expected_response
+    direct_command.assert_not_called()
+    command.execute.assert_not_called()
+    create_artifact.assert_called_once_with(
+        command.query_context,
+        None,
+        None,
+        preference_applied=True,
+    )
+
+
+def test_artifact_export_uses_generation_deadline_as_task_timeout(
+    app: SupersetApp,
+    mocker: MockerFixture,
+) -> None:
+    api = ChartDataRestApi.__new__(ChartDataRestApi)
+    query_context = MagicMock()
+    task = MagicMock(uuid="b8b61b7b-1cd3-4a31-a74a-0a95341afc06")
+    app.config["CHART_DATA_ARTIFACT_TTL_SECONDS"] = 123
+    mocker.patch("superset.charts.data.api.get_user_id", return_value=7)
+    serialize = mocker.patch(
+        "superset.charts.data.api.serialize_query_context_for_artifact",
+        return_value={"datasource": {"id": 1, "type": "table"}},
+    )
+    schedule = mocker.patch(
+        "superset.charts.data.api.generate_chart_data_export_artifact.schedule",
+        return_value=task,
+    )
+
+    with app.test_request_context("/api/v1/chart/data", method="POST"):
+        response = api._create_artifact_export_response(
+            query_context,
+            {"slice_name": "Orders"},
+            "orders.csv",
+            preference_applied=True,
+        )
+
+    assert response.status_code == 202
+    assert response.headers["Preference-Applied"] == "respond-async"
+    serialize.assert_called_once_with(query_context)
+    options = schedule.call_args.kwargs["options"]
+    assert options.task_name == "Export orders.csv"
+    assert options.timeout == 123
+
+
+def test_artifact_export_maps_broker_failure_to_service_unavailable(
+    app: SupersetApp,
+    mocker: MockerFixture,
+) -> None:
+    api = ChartDataRestApi.__new__(ChartDataRestApi)
+    app.config["CHART_DATA_ARTIFACT_TTL_SECONDS"] = 123
+    mocker.patch("superset.charts.data.api.get_user_id", return_value=7)
+    mocker.patch(
+        "superset.charts.data.api.serialize_query_context_for_artifact",
+        return_value={},
+    )
+    mocker.patch(
+        "superset.charts.data.api.generate_chart_data_export_artifact.schedule",
+        side_effect=OperationalError("broker unavailable"),
+    )
+
+    with app.test_request_context("/api/v1/chart/data", method="POST"):
+        response = api._create_artifact_export_response(
+            MagicMock(),
+            None,
+            "orders.csv",
+        )
+
+    assert response.status_code == 503
+    assert response.json == {"message": "The export service is temporarily unavailable"}
