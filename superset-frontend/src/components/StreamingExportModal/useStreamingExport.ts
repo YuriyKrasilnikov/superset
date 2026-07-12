@@ -54,6 +54,7 @@ interface StreamingExportParams {
 
 const NEWLINE_BYTE = 10; // '\n' character code
 const BLOB_FALLBACK_MAX_BYTES = 256 * 1024 * 1024;
+const TASK_POLL_INTERVAL_MS = 1000;
 const STREAM_ERROR_MARKER = '__STREAM_ERROR__:';
 
 interface WritableFileStream {
@@ -85,6 +86,12 @@ interface DirectoryPickerWindow extends Window {
 
 export type PreparedExportTarget =
   { kind: 'directory'; handle: WritableDirectoryHandle } | { kind: 'blob' };
+
+interface ArtifactExportResponse {
+  task_uuid: string;
+  status_url: string;
+  artifact_url: string;
+}
 
 interface ExportSinkResult {
   downloadUrl?: string;
@@ -348,6 +355,83 @@ const createExportSink = async (
   };
 };
 
+const isArtifactExportResponse = (
+  value: unknown,
+): value is ArtifactExportResponse => {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.task_uuid === 'string' &&
+    typeof candidate.status_url === 'string' &&
+    typeof candidate.artifact_url === 'string'
+  );
+};
+
+const waitForNextPoll = (signal: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('Export cancelled by user', 'AbortError'));
+    };
+    timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, TASK_POLL_INTERVAL_MS);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+
+const waitForArtifact = async (
+  accepted: ArtifactExportResponse,
+  signal: AbortSignal,
+): Promise<Response> => {
+  const activeStatuses = new Set([
+    'pending',
+    'in_progress',
+    'finalizing',
+    'aborting',
+  ]);
+  let shouldWait = false;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    if (shouldWait) {
+      // eslint-disable-next-line no-await-in-loop
+      await waitForNextPoll(signal);
+    }
+    shouldWait = true;
+    if (signal.aborted) {
+      throw new DOMException('Export cancelled by user', 'AbortError');
+    }
+    // eslint-disable-next-line no-await-in-loop
+    const statusResponse = await fetch(ensureUrlPrefix(accepted.status_url), {
+      credentials: 'same-origin',
+      signal,
+    });
+    if (!statusResponse.ok) {
+      throw new Error(
+        `Export status failed: ${statusResponse.status} ${statusResponse.statusText}`,
+      );
+    }
+    // eslint-disable-next-line no-await-in-loop
+    const statusPayload = (await statusResponse.json()) as unknown;
+    const status =
+      statusPayload && typeof statusPayload === 'object'
+        ? (statusPayload as Record<string, unknown>).status
+        : undefined;
+    if (status === 'success') {
+      return fetch(ensureUrlPrefix(accepted.artifact_url), {
+        credentials: 'same-origin',
+        signal,
+      });
+    }
+    if (typeof status !== 'string' || !activeStatuses.has(status)) {
+      throw new Error(`Export task ended with status: ${String(status)}`);
+    }
+  }
+};
+
 export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
   const [progress, setProgress] = useState<StreamingProgress>({
     rowsProcessed: 0,
@@ -360,6 +444,7 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
   });
   const [retryCount, setRetryCount] = useState(0);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const activeTaskUuidRef = useRef<string | null>(null);
   const executionIdRef = useRef(0);
   const lastExportParamsRef = useRef<StreamingExportParams | null>(null);
   const currentBlobUrlRef = useRef<string | null>(null);
@@ -421,12 +506,36 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
         );
         // Guard: ensure URL has app root prefix for subdirectory deployments
         const prefixedUrl = ensureUrlPrefix(url);
-        const response = await fetch(prefixedUrl, fetchOptions);
+        let response = await fetch(prefixedUrl, fetchOptions);
 
         if (!response.ok) {
           throw new Error(
             `Export failed: ${response.status} ${response.statusText}`,
           );
+        }
+
+        if (response.status === 202) {
+          const acceptedPayload = (await response.json()) as unknown;
+          if (!isArtifactExportResponse(acceptedPayload)) {
+            throw new Error('Export service returned an invalid task response');
+          }
+          if (executionIdRef.current !== executionId) {
+            SupersetClient.post({
+              endpoint: `/api/v1/task/${acceptedPayload.task_uuid}/cancel`,
+              jsonPayload: {},
+            }).catch(() => undefined);
+            throw new DOMException('Export cancelled by user', 'AbortError');
+          }
+          activeTaskUuidRef.current = acceptedPayload.task_uuid;
+          response = await waitForArtifact(
+            acceptedPayload,
+            abortController.signal,
+          );
+          if (!response.ok) {
+            throw new Error(
+              `Artifact download failed: ${response.status} ${response.statusText}`,
+            );
+          }
         }
 
         if (!response.body) {
@@ -562,6 +671,7 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
       } finally {
         if (executionIdRef.current === executionId) {
           isExportingRef.current = false;
+          activeTaskUuidRef.current = null;
           abortControllerRef.current = null;
         }
       }
@@ -615,11 +725,19 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
   }, [executeExport]);
 
   const cancelExport = useCallback(() => {
+    const taskUuid = activeTaskUuidRef.current;
+    activeTaskUuidRef.current = null;
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       updateProgress({
         status: ExportStatus.CANCELLED,
       });
+    }
+    if (taskUuid) {
+      SupersetClient.post({
+        endpoint: `/api/v1/task/${taskUuid}/cancel`,
+        jsonPayload: {},
+      }).catch(() => undefined);
     }
   }, [updateProgress]);
 
@@ -638,6 +756,7 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
     }
 
     isExportingRef.current = false;
+    activeTaskUuidRef.current = null;
     abortControllerRef.current = null;
     setProgress({
       rowsProcessed: 0,
@@ -655,6 +774,13 @@ export const useStreamingExport = (options: UseStreamingExportOptions = {}) => {
     () => () => {
       executionIdRef.current += 1;
       abortControllerRef.current?.abort();
+      if (activeTaskUuidRef.current) {
+        SupersetClient.post({
+          endpoint: `/api/v1/task/${activeTaskUuidRef.current}/cancel`,
+          jsonPayload: {},
+        }).catch(() => undefined);
+      }
+      activeTaskUuidRef.current = null;
       abortControllerRef.current = null;
       isExportingRef.current = false;
       if (currentBlobUrlRef.current) {

@@ -604,7 +604,7 @@ CELERY_CONFIG.beat_schedule["prune_chart_data_export_artifacts"] = {
 }
 ```
 
-Artifact downloads remain private to the initiating user and recheck export permission and datasource access. Custom roles using asynchronous exports also need `can_read` on `Task` for status and download endpoints, plus `can_write` on `Task` if users should be able to cancel active exports. Embedded guest exports do not use private GTF artifacts.
+Artifact downloads remain private to the initiating user and recheck export permission and datasource access. Custom roles using asynchronous exports also need `can_read` on `Task` for status and download endpoints, plus `can_write` on `Task` if users should be able to cancel active exports. Embedded guest exports do not use private GTF artifacts. Browsers supporting writable directory handles create a uniquely named file after the server confirms the final CSV, XLSX, or ZIP name and write response chunks directly to it. Other browsers, including cross-origin embedded contexts where directory access is unavailable, use a Blob fallback capped at 256 MiB.
 
 :::resources
 - [Blog: Feature Flags in Apache Superset](https://preset.io/blog/feature-flags-in-apache-superset-and-preset/)

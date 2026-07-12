@@ -368,6 +368,7 @@ test('non-guest chart exports fetch CSRF and include X-CSRFToken header', async 
   expect(requestInit.headers).toMatchObject({
     'X-CSRFToken': 'mock-csrf-token',
   });
+  expect(requestInit.headers).not.toHaveProperty('Prefer');
   expect((requestInit.body as URLSearchParams).has('guest_token')).toBe(false);
 });
 
@@ -427,6 +428,7 @@ test('SQL Lab exports fetch CSRF and omit guest_token even when guest token exis
   expect(requestInit.headers).toMatchObject({
     'X-CSRFToken': 'mock-csrf-token',
   });
+  expect(requestInit.headers).not.toHaveProperty('Prefer');
   expect(body.get('client_id')).toBe('test-id');
   expect(body.has('guest_token')).toBe(false);
 });
@@ -1558,6 +1560,108 @@ test('uses the server ZIP filename even when the proposed filename was CSV', asy
   });
   expect(result.current.progress.filename).toBe('multi-query.zip');
   expect(result.current.progress.rowsProcessed).toBe(0);
+});
+
+test('polls an accepted artifact task and streams its download into the prepared sink', async () => {
+  const artifactData = new TextEncoder().encode('id\n1\n');
+  const read = jest
+    .fn()
+    .mockResolvedValueOnce({ done: false, value: artifactData })
+    .mockResolvedValueOnce({ done: true, value: undefined });
+  const mockFetch = jest
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 202,
+      json: () =>
+        Promise.resolve({
+          task_uuid: 'task-uuid',
+          status_url: '/api/v1/task/task-uuid/status',
+          artifact_url: '/api/v1/task/task-uuid/artifact',
+        }),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ status: 'success' }),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: new Headers({
+        'Content-Disposition': 'attachment; filename="artifact.csv"',
+        'Content-Length': String(artifactData.length),
+      }),
+      body: { getReader: () => ({ read }) },
+    });
+  global.fetch = mockFetch;
+  const { result } = renderHook(() => useStreamingExport());
+
+  act(() => {
+    result.current.startExport({
+      url: '/api/v1/chart/data',
+      payload: { datasource: { id: 1, type: 'table' }, queries: [] },
+      exportType: 'csv',
+      exportSource: 'chart',
+    });
+  });
+
+  await waitFor(() => {
+    expect(result.current.progress.status).toBe(ExportStatus.COMPLETED);
+  });
+  expect(mockFetch).toHaveBeenNthCalledWith(
+    2,
+    '/api/v1/task/task-uuid/status',
+    expect.objectContaining({ credentials: 'same-origin' }),
+  );
+  expect(mockFetch).toHaveBeenNthCalledWith(
+    3,
+    '/api/v1/task/task-uuid/artifact',
+    expect.objectContaining({ credentials: 'same-origin' }),
+  );
+  expect(result.current.progress.filename).toBe('artifact.csv');
+  expect(result.current.progress.downloadUrl).toBe('blob:mock-url');
+});
+
+test('cancels the GTF task after an artifact export is accepted', async () => {
+  const mockFetch = jest
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 202,
+      json: () =>
+        Promise.resolve({
+          task_uuid: 'task-uuid',
+          status_url: '/api/v1/task/task-uuid/status',
+          artifact_url: '/api/v1/task/task-uuid/artifact',
+        }),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ status: 'in_progress' }),
+    });
+  global.fetch = mockFetch;
+  const { SupersetClient } = jest.requireMock('@superset-ui/core');
+  const { result } = renderHook(() => useStreamingExport());
+
+  act(() => {
+    result.current.startExport({
+      url: '/api/v1/chart/data',
+      payload: { datasource: { id: 1, type: 'table' }, queries: [] },
+      exportType: 'csv',
+      exportSource: 'chart',
+    });
+  });
+  await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(2));
+
+  act(() => result.current.cancelExport());
+
+  await waitFor(() => {
+    expect(SupersetClient.post).toHaveBeenCalledWith({
+      endpoint: '/api/v1/task/task-uuid/cancel',
+      jsonPayload: {},
+    });
+  });
+  expect(result.current.progress.status).toBe(ExportStatus.CANCELLED);
 });
 
 test('rejects an oversized response before reading it into the Blob fallback', async () => {
