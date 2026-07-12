@@ -1453,6 +1453,9 @@ CHART_DATA_ARTIFACT_STORE: Any | None = None
 # Maximum lifetime of an incomplete artifact tombstone. A completed artifact
 # receives a fresh interval of the same length after its object is durable.
 CHART_DATA_ARTIFACT_TTL_SECONDS = 24 * 60 * 60
+# Minimum time a recovery-requested abort/finalization may settle before the
+# artifact pruner publishes a terminal recovery outcome.
+CHART_DATA_ARTIFACT_RECOVERY_GRACE_SECONDS = 60
 
 # Excel Options: key/value pairs that will be passed as argument to DataFrame.to_excel
 # method.

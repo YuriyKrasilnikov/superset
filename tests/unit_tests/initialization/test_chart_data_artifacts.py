@@ -96,6 +96,33 @@ def test_artifact_exports_require_positive_integer_ttl(
         _initializer(app).configure_task_manager()
 
 
+@pytest.mark.parametrize("grace", [0, -1, True, "60"])
+def test_artifact_exports_require_positive_integer_recovery_grace(
+    grace: object,
+    tmp_path: Path,
+    mocker: MockerFixture,
+) -> None:
+    app = SupersetApp(__name__)
+    app.config["CHART_DATA_ARTIFACT_STORE"] = FileSystemChartDataArtifactStore(tmp_path)
+    app.config["CHART_DATA_ARTIFACT_TTL_SECONDS"] = 3600
+    app.config["CHART_DATA_ARTIFACT_RECOVERY_GRACE_SECONDS"] = grace
+    mocker.patch(
+        "superset.initialization.feature_flag_manager.is_feature_enabled",
+        return_value=True,
+    )
+
+    with (
+        app.app_context(),
+        pytest.raises(
+            RuntimeError,
+            match=(
+                "CHART_DATA_ARTIFACT_RECOVERY_GRACE_SECONDS must be a positive integer"
+            ),
+        ),
+    ):
+        _initializer(app).configure_task_manager()
+
+
 def test_valid_artifact_configuration_initializes_task_manager(
     tmp_path: Path,
     mocker: MockerFixture,
@@ -103,6 +130,7 @@ def test_valid_artifact_configuration_initializes_task_manager(
     app = SupersetApp(__name__)
     app.config["CHART_DATA_ARTIFACT_STORE"] = FileSystemChartDataArtifactStore(tmp_path)
     app.config["CHART_DATA_ARTIFACT_TTL_SECONDS"] = 3600
+    app.config["CHART_DATA_ARTIFACT_RECOVERY_GRACE_SECONDS"] = 60
     mocker.patch(
         "superset.initialization.feature_flag_manager.is_feature_enabled",
         return_value=True,

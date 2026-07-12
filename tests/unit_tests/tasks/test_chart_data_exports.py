@@ -26,6 +26,7 @@ from flask import current_app
 from pytest_mock import MockerFixture
 
 from superset.common.chart_data import ChartDataResultFormat, ChartDataResultType
+from superset.models.chart_data_export_artifact import ChartDataExportArtifactState
 from superset.tasks.chart_data_exports import (
     _materialize_export,
     generate_chart_data_export_artifact,
@@ -255,6 +256,7 @@ def test_artifact_task_persists_tombstone_before_materialization(
     assert artifact.content_type == "application/octet-stream"
     assert artifact.size_bytes == 0
     assert artifact.sha256 == ""
+    assert artifact.state == ChartDataExportArtifactState.CREATING.value
     materialize.assert_called_once()
     store.write.assert_not_called()
 
@@ -294,6 +296,10 @@ def test_artifact_task_refreshes_ttl_after_durable_write(
     create = mocker.patch(
         "superset.tasks.chart_data_exports.ChartDataExportArtifactDAO.create"
     )
+    mark_ready = mocker.patch(
+        "superset.tasks.chart_data_exports.ChartDataExportArtifactDAO.mark_ready",
+        return_value=True,
+    )
     mocker.patch("superset.db.session")
 
     generate_chart_data_export_artifact.func(
@@ -302,10 +308,19 @@ def test_artifact_task_refreshes_ttl_after_durable_write(
         "export.csv",
     )
 
+    mark_ready.assert_not_called()
+    context.update_task.assert_not_called()
+    context.on_finalize.call_args.args[0]()
+
     artifact = create.call_args.kwargs["item"]
-    assert artifact.expires_at == final_expiration
-    assert artifact.content_type == "text/csv"
-    assert artifact.size_bytes == len(b"a,b\n1,2\n")
+    assert mark_ready.call_args.args == (artifact.uuid, artifact.storage_key)
+    assert mark_ready.call_args.kwargs == {
+        "size_bytes": len(b"a,b\n1,2\n"),
+        "sha256": "492d5ea496056f1a6a6592241032fab764c321596317930b4fa0e1e8bc3b7470",
+        "filename": "export.csv",
+        "content_type": "text/csv",
+        "expires_at": final_expiration,
+    }
     assert context.update_task.call_args.kwargs["payload"]["expires_at"] == (
         final_expiration.isoformat()
     )
@@ -339,8 +354,12 @@ def test_artifact_task_cleanup_keeps_successful_artifact(
         return_value=(b"a,b\n1,2\n", "text/csv"),
     )
     mocker.patch("superset.tasks.chart_data_exports.ChartDataExportArtifactDAO.create")
+    mocker.patch(
+        "superset.tasks.chart_data_exports.ChartDataExportArtifactDAO.mark_ready",
+        return_value=True,
+    )
     find_artifact = mocker.patch(
-        "superset.tasks.chart_data_exports.ChartDataExportArtifactDAO.find_by_task_id"
+        "superset.tasks.chart_data_exports.ChartDataExportArtifactDAO.find_by_uuid"
     )
     mocker.patch("superset.db.session")
 
@@ -349,6 +368,7 @@ def test_artifact_task_cleanup_keeps_successful_artifact(
         7,
         "export.csv",
     )
+    context.on_finalize.call_args.args[0]()
     cleanup = context.on_cleanup.call_args.args[0]
     cleanup()
 
@@ -385,9 +405,10 @@ def test_artifact_task_cleanup_removes_completed_artifact_after_claimed_abort(
     )
     mocker.patch("superset.tasks.chart_data_exports.ChartDataExportArtifactDAO.create")
     mocker.patch(
-        "superset.tasks.chart_data_exports.ChartDataExportArtifactDAO.find_by_task_id",
+        "superset.tasks.chart_data_exports.ChartDataExportArtifactDAO.find_by_uuid",
         return_value=stored_artifact,
     )
+    stored_artifact.storage_key = mocker.ANY
     delete_artifact = mocker.patch(
         "superset.tasks.chart_data_exports."
         "delete_chart_data_export_artifact_transactionally"
@@ -477,8 +498,8 @@ def test_artifact_task_cooperatively_stops_after_abort(
         side_effect=abort_during_materialization,
     )
     mocker.patch("superset.tasks.chart_data_exports.ChartDataExportArtifactDAO.create")
-    finalize = mocker.patch(
-        "superset.tasks.chart_data_exports._finalize_artifact_metadata"
+    publish = mocker.patch(
+        "superset.tasks.chart_data_exports._publish_artifact_metadata"
     )
 
     generate_chart_data_export_artifact.func(
@@ -488,5 +509,5 @@ def test_artifact_task_cooperatively_stops_after_abort(
     )
 
     store.write.assert_not_called()
-    finalize.assert_not_called()
+    publish.assert_not_called()
     context.update_task.assert_not_called()

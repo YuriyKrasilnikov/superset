@@ -49,6 +49,7 @@ def upgrade() -> None:
         Column("datasource_id", String(64), nullable=False),
         Column("datasource_type", String(32), nullable=False),
         Column("storage_key", String(36), nullable=False),
+        Column("state", String(16), nullable=False, server_default="creating"),
         Column("filename", String(255), nullable=False),
         Column("content_type", String(128), nullable=False),
         Column("size_bytes", BigInteger, nullable=False),
@@ -64,7 +65,6 @@ def upgrade() -> None:
             "storage_key", name="uq_chart_data_export_artifacts_storage_key"
         ),
     )
-    create_index(TABLE, "ix_chart_data_export_artifacts_task_id", ["task_id"])
     create_index(TABLE, "ix_chart_data_export_artifacts_owner_id", ["owner_id"])
     create_index(TABLE, "ix_chart_data_export_artifacts_expires_at", ["expires_at"])
     create_fks_for_table(
@@ -104,7 +104,6 @@ def downgrade() -> None:
             "fk_chart_data_export_artifacts_changed_by_fk_ab_user",
         ],
     )
-    drop_index(TABLE, "ix_chart_data_export_artifacts_task_id")
     drop_index(TABLE, "ix_chart_data_export_artifacts_owner_id")
     drop_index(TABLE, "ix_chart_data_export_artifacts_expires_at")
     drop_table(TABLE)

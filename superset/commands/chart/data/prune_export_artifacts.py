@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import TYPE_CHECKING
 
 from flask import current_app
-from superset_core.tasks.types import TaskStatus
+from superset_core.tasks.types import TaskProperties, TaskStatus
 
-from superset import db
 from superset.charts.data.artifacts import (
     delete_chart_data_export_artifact_transactionally,
 )
@@ -41,36 +41,82 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _fail_expired_artifact_task(task: Task | None) -> bool:
-    """Terminalize an active task whose artifact generation deadline expired."""
-    if task is None or task.status not in ACTIVE_STATES:
-        return False
+class ArtifactRecoveryDisposition(str, Enum):
+    """Whether pruning may delete the artifact after task recovery."""
 
-    properties = {
+    KEEP = "keep"
+    DELETE = "delete"
+
+
+def _recovery_properties(task: Task) -> TaskProperties:
+    return {
         **task.properties_dict,
         "error_message": "Chart-data export expired before generation completed",
         "exception_type": "ArtifactGenerationExpired",
     }
+
+
+def _publish_completion(task: Task, status: TaskStatus) -> None:
+    try:
+        TaskManager.publish_completion(task.uuid, status.value)
+    except Exception:  # pylint: disable=broad-except
+        logger.exception(
+            "Failed to publish expiration outcome for chart-data export task %s",
+            task.uuid,
+        )
+
+
+def _recover_expired_artifact_task(
+    task: Task | None,
+    recovery_before: datetime,
+) -> ArtifactRecoveryDisposition:
+    """Advance one expired task through the authoritative recovery graph."""
+    if task is None or task.status not in ACTIVE_STATES:
+        return ArtifactRecoveryDisposition.DELETE
+
+    status = TaskStatus(task.status)
+    if status == TaskStatus.IN_PROGRESS:
+        transitioned = InternalStatusTransitionCommand(
+            task_uuid=task.uuid,
+            new_status=TaskStatus.ABORTING,
+            expected_status=TaskStatus.IN_PROGRESS,
+        ).run()
+        if transitioned:
+            TaskManager.publish_abort(task.uuid)
+        return ArtifactRecoveryDisposition.KEEP
+
+    if status in (TaskStatus.FINALIZING, TaskStatus.ABORTING):
+        changed_on = task.changed_on
+        if changed_on is None or changed_on > recovery_before:
+            return ArtifactRecoveryDisposition.KEEP
+        terminal_status = (
+            TaskStatus.FAILURE
+            if status == TaskStatus.FINALIZING
+            else TaskStatus.TIMED_OUT
+        )
+        transitioned = InternalStatusTransitionCommand(
+            task_uuid=task.uuid,
+            new_status=terminal_status,
+            expected_status=status,
+            properties=_recovery_properties(task),
+            set_ended_at=True,
+        ).run()
+        if transitioned:
+            _publish_completion(task, terminal_status)
+            return ArtifactRecoveryDisposition.DELETE
+        return ArtifactRecoveryDisposition.KEEP
+
     transitioned = InternalStatusTransitionCommand(
         task_uuid=task.uuid,
         new_status=TaskStatus.FAILURE,
-        expected_status=[
-            TaskStatus.PENDING,
-            TaskStatus.IN_PROGRESS,
-            TaskStatus.ABORTING,
-        ],
-        properties=properties,
+        expected_status=TaskStatus.PENDING,
+        properties=_recovery_properties(task),
         set_ended_at=True,
     ).run()
     if transitioned:
-        try:
-            TaskManager.publish_completion(task.uuid, TaskStatus.FAILURE.value)
-        except Exception:  # pylint: disable=broad-except
-            logger.exception(
-                "Failed to publish expiration failure for chart-data export task %s",
-                task.uuid,
-            )
-    return transitioned
+        _publish_completion(task, TaskStatus.FAILURE)
+        return ArtifactRecoveryDisposition.DELETE
+    return ArtifactRecoveryDisposition.KEEP
 
 
 class ChartDataExportArtifactPruneCommand(BaseCommand):
@@ -82,6 +128,10 @@ class ChartDataExportArtifactPruneCommand(BaseCommand):
     def run(self) -> int:
         """Delete expired artifacts independently and return the deleted count."""
         expires_before = datetime.now(timezone.utc).replace(tzinfo=None)
+        recovery_grace = timedelta(
+            seconds=current_app.config["CHART_DATA_ARTIFACT_RECOVERY_GRACE_SECONDS"]
+        )
+        recovery_before = expires_before - recovery_grace
         artifacts = ChartDataExportArtifactDAO.find_expired(
             expires_before,
             self._max_rows_per_run,
@@ -89,15 +139,12 @@ class ChartDataExportArtifactPruneCommand(BaseCommand):
         deleted = 0
         for artifact in artifacts:
             try:
-                task_was_failed = _fail_expired_artifact_task(artifact.task)
-                if not task_was_failed:
-                    # A worker may have finalized the metadata and transitioned the
-                    # task after the prune query selected its earlier tombstone.
-                    # Refreshing the deadline closes that race even when the task
-                    # was already terminal and no status transaction was needed.
-                    db.session.refresh(artifact)
-                    if artifact.expires_at > expires_before:
-                        continue
+                disposition = _recover_expired_artifact_task(
+                    artifact.task,
+                    recovery_before,
+                )
+                if disposition == ArtifactRecoveryDisposition.KEEP:
+                    continue
                 delete_chart_data_export_artifact_transactionally(artifact)
                 deleted += 1
             except Exception:  # pylint: disable=broad-except
@@ -113,16 +160,17 @@ class ChartDataExportArtifactPruneCommand(BaseCommand):
             artifact_ttl = timedelta(
                 seconds=current_app.config["CHART_DATA_ARTIFACT_TTL_SECONDS"]
             )
-            pending_before = datetime.now() - artifact_ttl
+            pending_before = expires_before - artifact_ttl
             started_before = expires_before - artifact_ttl
             stale_tasks = ChartDataExportArtifactDAO.find_stale_tasks_without_artifacts(
                 pending_before,
                 started_before,
+                recovery_before,
                 remaining_rows,
             )
             for task in stale_tasks:
                 try:
-                    _fail_expired_artifact_task(task)
+                    _recover_expired_artifact_task(task, recovery_before)
                 except Exception:  # pylint: disable=broad-except
                     logger.exception(
                         "Failed to recover chart-data export task %s without an "

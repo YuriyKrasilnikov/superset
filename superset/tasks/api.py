@@ -48,7 +48,10 @@ from superset.daos.exceptions import (
 )
 from superset.exceptions import SupersetSecurityException
 from superset.extensions import event_logger
-from superset.models.chart_data_export_artifact import ChartDataExportArtifact
+from superset.models.chart_data_export_artifact import (
+    ChartDataExportArtifact,
+    ChartDataExportArtifactState,
+)
 from superset.models.tasks import Task
 from superset.tasks.filters import TaskFilter
 from superset.tasks.schemas import (
@@ -120,7 +123,11 @@ class TaskRestApi(BaseSupersetModelRestApi):
             return None
 
         artifact = ChartDataExportArtifactDAO.find_by_task_id(task.id)
-        if artifact is None or artifact.owner_id != task.user_id:
+        if (
+            artifact is None
+            or artifact.owner_id != task.user_id
+            or artifact.state != ChartDataExportArtifactState.READY.value
+        ):
             return None
 
         expires_at = artifact.expires_at

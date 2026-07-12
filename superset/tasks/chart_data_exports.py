@@ -22,6 +22,7 @@ import hashlib
 import tempfile
 import threading
 import zipfile
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable
@@ -34,6 +35,7 @@ from werkzeug.utils import secure_filename
 from superset import security_manager
 from superset.charts.client_processing import apply_client_processing
 from superset.charts.data.artifacts import (
+    ChartDataArtifactStore,
     delete_chart_data_export_artifact_transactionally,
     get_chart_data_artifact_store,
 )
@@ -42,8 +44,12 @@ from superset.commands.chart.data.get_data_command import ChartDataCommand
 from superset.common.chart_data import ChartDataResultFormat, ChartDataResultType
 from superset.daos.chart_data_export_artifact import ChartDataExportArtifactDAO
 from superset.daos.tasks import TaskDAO
-from superset.models.chart_data_export_artifact import ChartDataExportArtifact
+from superset.models.chart_data_export_artifact import (
+    ChartDataExportArtifact,
+    ChartDataExportArtifactState,
+)
 from superset.tasks.ambient_context import get_context
+from superset.tasks.context import TaskContext
 from superset.tasks.decorators import task
 from superset.utils import json
 from superset.utils.core import override_user
@@ -52,6 +58,61 @@ from superset.utils.decorators import transaction
 _WRITE_CHUNK_SIZE = 1024 * 1024
 _MAX_ARTIFACT_FILENAME_LENGTH = 255
 _INCOMPLETE_ARTIFACT_CONTENT_TYPE = "application/octet-stream"
+
+
+@dataclass(frozen=True)
+class PreparedArtifactPublication:
+    """Metadata for an object durably written but not yet published."""
+
+    size_bytes: int
+    sha256: str
+    filename: str
+    content_type: str
+    expires_at: datetime
+
+
+@dataclass
+class ArtifactPublicationLifecycle:
+    """Coordinate abort, fenced publication, and compensating cleanup."""
+
+    context: TaskContext
+    artifact: ChartDataExportArtifact
+    store: ChartDataArtifactStore
+    aborted: threading.Event = field(default_factory=threading.Event)
+    ready: threading.Event = field(default_factory=threading.Event)
+    publication: PreparedArtifactPublication | None = None
+
+    def abort(self) -> None:
+        self.aborted.set()
+
+    def cleanup(self) -> None:
+        if self.ready.is_set() and not self.aborted.is_set():
+            return
+        stored_artifact = ChartDataExportArtifactDAO.find_by_uuid(self.artifact.uuid)
+        if (
+            stored_artifact is not None
+            and stored_artifact.storage_key == self.artifact.storage_key
+        ):
+            delete_chart_data_export_artifact_transactionally(stored_artifact)
+        else:
+            self.store.delete(self.artifact.storage_key)
+
+    def publish(self) -> None:
+        if self.publication is None or self.aborted.is_set():
+            raise RuntimeError("Artifact was not prepared for publication")
+        _publish_artifact_metadata(self.artifact, self.publication)
+        self.context.update_task(
+            progress=1.0,
+            payload={
+                "artifact_uuid": str(self.artifact.uuid),
+                "content_type": self.publication.content_type,
+                "expires_at": self.publication.expires_at.isoformat(),
+                "filename": self.publication.filename,
+                "sha256": self.publication.sha256,
+                "size_bytes": self.publication.size_bytes,
+            },
+        )
+        self.ready.set()
 
 
 def _query_context_payload(query_context: Any) -> dict[str, Any]:
@@ -159,20 +220,21 @@ def _create_artifact_tombstone(artifact: ChartDataExportArtifact) -> None:
 
 
 @transaction()
-def _finalize_artifact_metadata(
+def _publish_artifact_metadata(
     artifact: ChartDataExportArtifact,
-    size: int,
-    sha256: str,
-    filename: str,
-    content_type: str,
-    expires_at: datetime,
+    publication: PreparedArtifactPublication,
 ) -> None:
-    """Commit metadata only after the artifact object is durable."""
-    artifact.size_bytes = size
-    artifact.sha256 = sha256
-    artifact.filename = filename
-    artifact.content_type = content_type
-    artifact.expires_at = expires_at
+    """Atomically publish metadata for the worker's creating tombstone."""
+    if not ChartDataExportArtifactDAO.mark_ready(
+        artifact.uuid,
+        artifact.storage_key,
+        size_bytes=publication.size_bytes,
+        sha256=publication.sha256,
+        filename=publication.filename,
+        content_type=publication.content_type,
+        expires_at=publication.expires_at,
+    ):
+        raise RuntimeError("Artifact publication fence was lost")
 
 
 @task(name="chart_data.generate_export_artifact", scope=TaskScope.PRIVATE)
@@ -193,74 +255,53 @@ def generate_chart_data_export_artifact(
 
     store = get_chart_data_artifact_store()
     storage_key = str(uuid4())
-    aborted = threading.Event()
-    artifact_complete = threading.Event()
-
-    @context.on_abort
-    def abort_export() -> None:
-        aborted.set()
-
-    @context.on_cleanup
-    def cleanup_incomplete_export() -> None:
-        # Terminal task state is published only after cleanup. Preserve the object
-        # only when every artifact phase completed and no cancellation was claimed.
-        if artifact_complete.is_set() and not aborted.is_set():
-            return
-        artifact = ChartDataExportArtifactDAO.find_by_task_id(task_record.id)
-        if artifact is not None:
-            delete_chart_data_export_artifact_transactionally(artifact)
-        else:
-            store.delete(storage_key)
 
     datasource = payload["datasource"]
     artifact = ChartDataExportArtifact(
+        uuid=uuid4(),
         task_id=task_record.id,
         owner_id=owner_id,
         datasource_id=str(datasource["id"]),
         datasource_type=str(datasource["type"]),
         storage_key=storage_key,
+        state=ChartDataExportArtifactState.CREATING.value,
         filename=_artifact_filename(filename, ".csv"),
         content_type=_INCOMPLETE_ARTIFACT_CONTENT_TYPE,
         size_bytes=0,
         sha256="",
         expires_at=_artifact_expiration(),
     )
+    lifecycle = ArtifactPublicationLifecycle(context, artifact, store)
+    context.on_abort(lifecycle.abort)
+    context.on_cleanup(lifecycle.cleanup)
+    context.on_finalize(lifecycle.publish)
     with override_user(user):
         _create_artifact_tombstone(artifact)
 
+    if lifecycle.aborted.is_set():
+        return
     with override_user(user):
         content, content_type = _materialize_export(payload)
     try:
-        if aborted.is_set():
+        if lifecycle.aborted.is_set():
             return
 
         extension = ".zip" if content_type == "application/zip" else ".csv"
         artifact_filename = _artifact_filename(filename, extension)
         digest = hashlib.sha256()
-        size = store.write(storage_key, _tracked_chunks(content, digest, aborted))
-        if aborted.is_set():
+        size = store.write(
+            storage_key,
+            _tracked_chunks(content, digest, lifecycle.aborted),
+        )
+        if lifecycle.aborted.is_set():
             return
     finally:
         if not isinstance(content, bytes):
             content.close()
-    expires_at = _artifact_expiration()
-    _finalize_artifact_metadata(
-        artifact,
-        size,
-        digest.hexdigest(),
-        artifact_filename,
-        content_type,
-        expires_at,
+    lifecycle.publication = PreparedArtifactPublication(
+        size_bytes=size,
+        sha256=digest.hexdigest(),
+        filename=artifact_filename,
+        content_type=content_type,
+        expires_at=_artifact_expiration(),
     )
-    context.update_task(
-        progress=1.0,
-        payload={
-            "artifact_uuid": str(artifact.uuid),
-            "content_type": content_type,
-            "expires_at": expires_at.isoformat(),
-            "filename": artifact_filename,
-            "sha256": artifact.sha256,
-            "size_bytes": size,
-        },
-    )
-    artifact_complete.set()

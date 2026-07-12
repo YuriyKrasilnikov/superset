@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import uuid as uuid_module
+from enum import Enum
 
 from flask_appbuilder import Model
 from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, Integer, String
@@ -26,6 +27,13 @@ from sqlalchemy.orm import relationship
 from sqlalchemy_utils import UUIDType
 
 from superset.models.helpers import AuditMixinNullable
+
+
+class ChartDataExportArtifactState(str, Enum):
+    """Durable publication states for an export object."""
+
+    CREATING = "creating"
+    READY = "ready"
 
 
 class ChartDataExportArtifact(AuditMixinNullable, Model):
@@ -42,7 +50,6 @@ class ChartDataExportArtifact(AuditMixinNullable, Model):
         ForeignKey("tasks.id", ondelete="CASCADE"),
         nullable=False,
         unique=True,
-        index=True,
     )
     owner_id = Column(
         Integer,
@@ -53,6 +60,12 @@ class ChartDataExportArtifact(AuditMixinNullable, Model):
     datasource_id = Column(String(64), nullable=False)
     datasource_type = Column(String(32), nullable=False)
     storage_key = Column(String(36), nullable=False, unique=True)
+    state = Column(
+        String(16),
+        nullable=False,
+        default=ChartDataExportArtifactState.CREATING.value,
+        server_default=ChartDataExportArtifactState.CREATING.value,
+    )
     filename = Column(String(255), nullable=False)
     content_type = Column(String(128), nullable=False)
     size_bytes = Column(BigInteger, nullable=False)

@@ -23,6 +23,7 @@ from uuid import uuid4
 from pytest_mock import MockerFixture
 from superset_core.tasks.types import TaskStatus
 
+from superset.models.chart_data_export_artifact import ChartDataExportArtifactState
 from superset.tasks.api import TaskRestApi
 
 
@@ -39,6 +40,7 @@ def _artifact(owner_id: int, expired: bool = False) -> MagicMock:
     artifact.owner_id = owner_id
     artifact.datasource_type = "table"
     artifact.datasource_id = "7"
+    artifact.state = ChartDataExportArtifactState.READY.value
     offset = timedelta(seconds=-1 if expired else 60)
     artifact.expires_at = datetime.now(timezone.utc) + offset
     return artifact
@@ -87,6 +89,26 @@ def test_resolve_export_artifact_reauthorizes_datasource(
     assert TaskRestApi._resolve_export_artifact(uuid4(), user_id=7) is artifact
     get_datasource.assert_called_once()
     security_manager.raise_for_access.assert_called_once_with(datasource=datasource)
+
+
+def test_resolve_export_artifact_rejects_unpublished_metadata(
+    mocker: MockerFixture,
+) -> None:
+    task = _successful_task(owner_id=7)
+    artifact = _artifact(owner_id=7)
+    artifact.state = ChartDataExportArtifactState.CREATING.value
+    mocker.patch(
+        "superset.daos.tasks.TaskDAO.find_one_or_none",
+        return_value=task,
+    )
+    mocker.patch(
+        "superset.tasks.api.ChartDataExportArtifactDAO.find_by_task_id",
+        return_value=artifact,
+    )
+    get_datasource = mocker.patch("superset.tasks.api.DatasourceDAO.get_datasource")
+
+    assert TaskRestApi._resolve_export_artifact(uuid4(), user_id=7) is None
+    get_datasource.assert_not_called()
 
 
 def test_resolve_export_artifact_deletes_expired_object_before_metadata(
