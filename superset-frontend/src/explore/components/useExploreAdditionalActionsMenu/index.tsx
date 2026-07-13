@@ -265,8 +265,9 @@ export const useExploreAdditionalActionsMenu = (
   const {
     progress,
     isExporting: _isExporting,
+    prepareExport,
     startExport,
-    cancelExport: _cancelExport,
+    cancelExport,
     resetExport,
     retryExport,
   } = useStreamingExport({
@@ -279,9 +280,10 @@ export const useExploreAdditionalActionsMenu = (
   });
 
   const handleCloseStreamingModal = useCallback(() => {
+    cancelExport();
     setIsStreamingModalVisible(false);
     resetExport();
-  }, [resetExport]);
+  }, [cancelExport, resetExport]);
 
   const handleDownloadComplete = useCallback(() => {
     addSuccessToast(t('CSV file downloaded successfully'));
@@ -401,10 +403,19 @@ export const useExploreAdditionalActionsMenu = (
       const chartName =
         slice?.slice_name || latestQueryFormData.viz_type || 'chart';
       const safeChartName = chartName.replace(/[^a-zA-Z0-9_-]/g, '_');
-      filename = `${safeChartName}${timestamp}.csv`;
+      const extension =
+        queriesResponse && queriesResponse.length > 1 ? 'zip' : 'csv';
+      filename = `${safeChartName}${timestamp}.${extension}`;
     }
 
     try {
+      const exportTarget = shouldUseStreaming
+        ? await prepareExport(filename, 'csv')
+        : undefined;
+      if (shouldUseStreaming && !exportTarget) {
+        return null;
+      }
+      const preparedTarget = exportTarget ?? undefined;
       await exportChart({
         formData: latestQueryFormData as QueryFormData,
         ownState,
@@ -420,6 +431,7 @@ export const useExploreAdditionalActionsMenu = (
                   filename,
                   expectedRows: actualRowCount,
                   exportType: exportParams.exportType as 'csv' | 'xlsx',
+                  target: preparedTarget,
                 });
               }
             }
@@ -436,6 +448,7 @@ export const useExploreAdditionalActionsMenu = (
     chart,
     streamingThreshold,
     slice,
+    prepareExport,
     startExport,
     handleExportError,
   ]);

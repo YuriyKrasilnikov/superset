@@ -82,10 +82,12 @@ jest.mock('src/components/ErrorMessage', () => ({
 
 // Mock useStreamingExport to capture startExport calls
 const mockStartExport = jest.fn();
+const mockPrepareExport = jest.fn(() => Promise.resolve({ kind: 'blob' }));
 const mockResetExport = jest.fn();
 const mockCancelExport = jest.fn();
 jest.mock('src/components/StreamingExportModal/useStreamingExport', () => ({
   useStreamingExport: () => ({
+    prepareExport: mockPrepareExport,
     startExport: mockStartExport,
     resetExport: mockResetExport,
     cancelExport: mockCancelExport,
@@ -181,6 +183,7 @@ describe('ResultSet', () => {
   beforeEach(() => {
     applicationRootMock.mockReturnValue('');
     mockStartExport.mockClear();
+    mockPrepareExport.mockClear();
     mockOpenInNewTab.mockClear();
     mockPostFormData.mockReset();
     mockPostFormData.mockResolvedValue('test-form-data-key');
@@ -784,8 +787,11 @@ describe('ResultSet', () => {
       const exportButton = getByTestId('export-csv-button');
       fireEvent.click(exportButton);
 
-      // Verify startExport was called exactly once
-      expect(mockStartExport).toHaveBeenCalledTimes(1);
+      // The target must be prepared while handling the user gesture.
+      await waitFor(() => {
+        expect(mockPrepareExport).toHaveBeenCalledTimes(1);
+        expect(mockStartExport).toHaveBeenCalledTimes(1);
+      });
 
       // The URL should match the expected prefixed URL
       expect(mockStartExport).toHaveBeenCalledWith(
