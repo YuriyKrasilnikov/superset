@@ -20,15 +20,22 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Any, Callable, cast, Generic, ParamSpec, TYPE_CHECKING, TypeVar
+from typing import (
+    Any,
+    Callable,
+    cast,
+    Generic,
+    overload,
+    ParamSpec,
+    TYPE_CHECKING,
+    TypeVar,
+)
 
-from superset_core.tasks.types import TaskOptions, TaskScope, TaskStatus
+from superset_core.tasks.types import TaskOptions, TaskScope
 
 from superset import is_feature_enabled
 from superset.commands.tasks.exceptions import GlobalTaskFrameworkDisabledError
-from superset.tasks.ambient_context import use_context
 from superset.tasks.constants import TERMINAL_STATES
-from superset.tasks.context import TaskContext
 from superset.tasks.manager import TaskManager
 from superset.tasks.registry import TaskRegistry
 from superset.tasks.utils import generate_random_task_key
@@ -40,6 +47,26 @@ logger = logging.getLogger(__name__)
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
+
+@overload
+def task(
+    func: Callable[P, R],
+    *,
+    name: str | None = None,
+    scope: TaskScope = TaskScope.PRIVATE,
+    timeout: int | None = None,
+) -> TaskWrapper[P]: ...
+
+
+@overload
+def task(
+    func: None = None,
+    *,
+    name: str | None = None,
+    scope: TaskScope = TaskScope.PRIVATE,
+    timeout: int | None = None,
+) -> Callable[[Callable[P, R]], TaskWrapper[P]]: ...
 
 
 def task(
@@ -400,163 +427,29 @@ class TaskWrapper(Generic[P]):
         :param kwargs: Keyword arguments for the task function
         :returns: Task in terminal state
         """
-        from superset.commands.tasks.internal_update import (
-            InternalStatusTransitionCommand,
+        from superset.tasks.executor import execute_task_callable
+
+        return execute_task_callable(
+            task=task,
+            task_name=self.name,
+            function=self.func,
+            args=args,
+            kwargs=kwargs,
+            timeout=options.timeout,
         )
-        from superset.daos.tasks import TaskDAO
-        from superset.tasks.constants import ABORT_STATES
 
-        # PRE-EXECUTION CHECK: Don't execute if already aborted/aborting
-        # (Matches async flow in scheduler.py)
-        if task.status in ABORT_STATES:
-            logger.info(
-                "Task %s (uuid=%s) was aborted before execution started",
-                self.name,
-                task.uuid,
-            )
-            # Ensure status is ABORTED (not just ABORTING)
-            InternalStatusTransitionCommand(
-                task_uuid=task.uuid,
-                new_status=TaskStatus.ABORTED,
-                expected_status=[TaskStatus.PENDING, TaskStatus.ABORTING],
-                set_ended_at=True,
-            ).run()
-            # Refresh to get updated task
-            refreshed = TaskDAO.find_one_or_none(uuid=task.uuid)
-            return refreshed if refreshed else task
+    @overload
+    def schedule(self, *args: P.args, **kwargs: P.kwargs) -> Task: ...
 
-        # Atomic transition: PENDING → IN_PROGRESS (set started_at for duration
-        # tracking)
-        task_uuid = task.uuid  # Cache UUID before any potential state changes
-        if not InternalStatusTransitionCommand(
-            task_uuid=task_uuid,
-            new_status=TaskStatus.IN_PROGRESS,
-            expected_status=TaskStatus.PENDING,
-            set_started_at=True,
-        ).run():
-            # Status wasn't PENDING - task may have been aborted concurrently
-            logger.warning(
-                "Task %s (uuid=%s) failed PENDING → IN_PROGRESS transition "
-                "(may have been aborted concurrently)",
-                self.name,
-                task_uuid,
-            )
-            refreshed = TaskDAO.find_one_or_none(uuid=task_uuid)
-            return refreshed if refreshed else task
+    @overload
+    def schedule(
+        self,
+        *args: Any,
+        options: TaskOptions | None = None,
+        **kwargs: Any,
+    ) -> Task: ...
 
-        # Update cached status (no DB read needed - we just wrote IN_PROGRESS)
-        task.status = TaskStatus.IN_PROGRESS.value
-
-        # Build context with the updated task entity
-        ctx = TaskContext(task)
-
-        # Start timeout timer if configured
-        if options.timeout:
-            ctx.start_timeout_timer(options.timeout)
-            logger.debug(
-                "Started timeout timer for task %s: %d seconds",
-                task.uuid,
-                options.timeout,
-            )
-
-        # Track final task state for completion notification
-        final_task: Task | None = None
-
-        try:
-            # Execute with ambient context
-            with use_context(ctx):
-                self.func(*args, **kwargs)
-
-            # Determine terminal status based on abort detection
-            # Use atomic conditional updates to prevent overwriting concurrent abort
-            if ctx._abort_detected or ctx.timeout_triggered:
-                # Abort was detected - transition ABORTING → terminal
-                if ctx.timeout_triggered:
-                    InternalStatusTransitionCommand(
-                        task_uuid=task_uuid,
-                        new_status=TaskStatus.TIMED_OUT,
-                        expected_status=TaskStatus.ABORTING,
-                        set_ended_at=True,
-                    ).run()
-                    logger.info(
-                        "Task %s (uuid=%s) timed out and completed cleanup",
-                        self.name,
-                        task_uuid,
-                    )
-                else:
-                    InternalStatusTransitionCommand(
-                        task_uuid=task_uuid,
-                        new_status=TaskStatus.ABORTED,
-                        expected_status=TaskStatus.ABORTING,
-                        set_ended_at=True,
-                    ).run()
-                    logger.info(
-                        "Task %s (uuid=%s) was aborted by user",
-                        self.name,
-                        task_uuid,
-                    )
-            else:
-                # Normal completion - atomic IN_PROGRESS → SUCCESS
-                # This will fail (return False) if task was concurrently aborted
-                if InternalStatusTransitionCommand(
-                    task_uuid=task_uuid,
-                    new_status=TaskStatus.SUCCESS,
-                    expected_status=TaskStatus.IN_PROGRESS,
-                    set_ended_at=True,
-                ).run():
-                    logger.debug(
-                        "Synchronous execution of task %s (uuid=%s) "
-                        "completed successfully",
-                        self.name,
-                        task_uuid,
-                    )
-                else:
-                    # Transition failed - task was likely aborted concurrently
-                    logger.info(
-                        "Task %s (uuid=%s) IN_PROGRESS → SUCCESS failed "
-                        "(may have been aborted concurrently)",
-                        self.name,
-                        task_uuid,
-                    )
-
-            # Refresh once at end to return current state
-            final_task = TaskDAO.find_one_or_none(uuid=task_uuid)
-            return final_task if final_task else task
-
-        except Exception as ex:
-            # Atomic transition to FAILURE (only if still IN_PROGRESS)
-            InternalStatusTransitionCommand(
-                task_uuid=task_uuid,
-                new_status=TaskStatus.FAILURE,
-                expected_status=[TaskStatus.IN_PROGRESS, TaskStatus.ABORTING],
-                properties={"error_message": str(ex)},
-                set_ended_at=True,
-            ).run()
-
-            logger.error(
-                "Synchronous execution of task %s (uuid=%s) failed: %s",
-                self.name,
-                task_uuid,
-                str(ex),
-                exc_info=True,
-            )
-
-            # Refresh once at end to return current state
-            final_task = TaskDAO.find_one_or_none(uuid=task_uuid)
-            return final_task if final_task else task
-
-        finally:
-            # Always clean up timer and handlers
-            ctx._run_cleanup()
-
-            # Publish completion notification for any waiters
-            # Use final_task if set by try/except, otherwise refresh (fallback)
-            if final_task is None:
-                final_task = TaskDAO.find_one_or_none(uuid=task_uuid)
-            if final_task and final_task.status in TERMINAL_STATES:
-                TaskManager.publish_completion(task_uuid, final_task.status)
-
-    def schedule(self, *args: P.args, **kwargs: P.kwargs) -> "Task":
+    def schedule(self, *args: Any, **kwargs: Any) -> Task:
         """
         Schedule this task for asynchronous execution.
 

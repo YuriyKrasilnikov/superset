@@ -107,6 +107,7 @@ export function canAbortTask(task: Task): boolean {
 export enum TaskStatus {
   Pending = 'pending',
   InProgress = 'in_progress',
+  Finalizing = 'finalizing',
   Success = 'success',
   Failure = 'failure',
   Aborting = 'aborting',

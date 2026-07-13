@@ -38,6 +38,7 @@ from superset_core.tasks.types import TaskProperties, TaskStatus
 from superset.commands.base import BaseCommand
 from superset.commands.tasks.exceptions import TaskUpdateFailedError
 from superset.daos.tasks import TaskDAO
+from superset.tasks.constants import ensure_allowed_status_transition
 from superset.utils.decorators import on_error, transaction
 
 logger = logging.getLogger(__name__)
@@ -79,8 +80,7 @@ class InternalUpdateTaskCommand(BaseCommand):
         self._payload = payload
 
     def validate(self) -> None:
-        """No validation needed for internal command."""
-        pass
+        """Payload updates do not participate in the status state machine."""
 
     @transaction(on_error=partial(on_error, reraise=TaskUpdateFailedError))
     def run(self) -> bool:
@@ -119,8 +119,8 @@ class InternalStatusTransitionCommand(BaseCommand):
 
     Use cases:
     - PENDING → IN_PROGRESS: Task pickup (executor starting)
-    - IN_PROGRESS → SUCCESS: Normal completion (only if not ABORTING)
-    - IN_PROGRESS → FAILURE: Task exception (only if not ABORTING)
+    - IN_PROGRESS → FINALIZING: Claim success-only result publication
+    - FINALIZING → SUCCESS/FAILURE: Complete fenced finalization
     - ABORTING → ABORTED: Abort handlers completed successfully
     - ABORTING → TIMED_OUT: Timeout handlers completed successfully
     - ABORTING → FAILURE: Abort/cleanup handlers failed
@@ -129,8 +129,8 @@ class InternalStatusTransitionCommand(BaseCommand):
     - Executor tries to set SUCCESS but task was concurrently aborted
     - Multiple executors try to pick up the same task
 
-    WARNING: This command should ONLY be used by executor code (decorators.py,
-    scheduler.py). External callers should use UpdateTaskCommand.
+    WARNING: This command should ONLY be used by framework executor and recovery
+    code. External callers should use UpdateTaskCommand.
     """
 
     def __init__(
@@ -164,8 +164,15 @@ class InternalStatusTransitionCommand(BaseCommand):
         self._set_ended_at = set_ended_at
 
     def validate(self) -> None:
-        """No validation needed for internal command."""
-        pass
+        """Reject transition edges outside the centralized GTF state graph."""
+        target = TaskStatus(self._new_status)
+        expected = (
+            self._expected_status
+            if isinstance(self._expected_status, list)
+            else [self._expected_status]
+        )
+        for current in expected:
+            ensure_allowed_status_transition(TaskStatus(current), target)
 
     @transaction(on_error=partial(on_error, reraise=TaskUpdateFailedError))
     def run(self) -> bool:
@@ -174,6 +181,7 @@ class InternalStatusTransitionCommand(BaseCommand):
 
         :returns: True if status was updated (expected matched), False otherwise
         """
+        self.validate()
         return TaskDAO.conditional_status_update(
             task_uuid=self._task_uuid,
             new_status=self._new_status,

@@ -110,12 +110,19 @@ class CancelTaskCommand(BaseCommand):
         with task_lock(dedup_key):
             result = self._execute_with_transaction()
 
-        # Publish abort notification AFTER transaction commits
-        # This prevents race conditions where listeners check DB before commit
-        if self._should_publish_abort:
+        # Publish lifecycle notification AFTER transaction commit so listeners
+        # never observe the old status. Pending tasks complete immediately;
+        # running tasks notify their abort handlers instead.
+        if self._should_publish_abort or result.status == TaskStatus.ABORTED.value:
             from superset.tasks.manager import TaskManager
 
-            TaskManager.publish_abort(self._task_uuid)
+            if self._should_publish_abort:
+                TaskManager.publish_abort(self._task_uuid)
+            else:
+                TaskManager.publish_completion(
+                    self._task_uuid,
+                    TaskStatus.ABORTED.value,
+                )
 
         return result
 

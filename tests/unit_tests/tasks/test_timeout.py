@@ -16,12 +16,13 @@
 # under the License.
 """Unit tests for GTF timeout handling."""
 
+import threading
 import time
 from unittest.mock import MagicMock, patch
 from uuid import UUID
 
 import pytest
-from superset_core.tasks.types import TaskOptions, TaskScope
+from superset_core.tasks.types import TaskOptions, TaskScope, TaskStatus
 
 from superset.tasks.context import TaskContext
 from superset.tasks.decorators import TaskWrapper
@@ -263,6 +264,88 @@ class TestTimeoutTimer:
 class TestTimeoutTrigger:
     """Test timeout trigger behavior when timer fires."""
 
+    def test_late_timeout_does_not_reopen_completed_execution(
+        self,
+        task_context_for_timeout: TaskContext,
+    ) -> None:
+        ctx = task_context_for_timeout
+        ctx.mark_execution_completed()
+        with patch("superset.tasks.context.threading.Timer") as timer:
+            ctx.start_timeout_timer(10)
+            timer.call_args.args[1]()
+
+        assert ctx.timeout_triggered is False
+        assert ctx.interruption_status is None
+
+    def test_late_abort_does_not_run_handler_after_execution_completed(
+        self,
+        task_context_for_timeout: TaskContext,
+    ) -> None:
+        handler = MagicMock()
+        task_context_for_timeout._abort_handlers.append(handler)
+
+        task_context_for_timeout.mark_execution_completed()
+        task_context_for_timeout._on_abort_detected()
+
+        handler.assert_not_called()
+        assert task_context_for_timeout.interruption_status is None
+
+    def test_abort_handler_and_execution_completion_are_serialized(
+        self,
+        task_context_for_timeout: TaskContext,
+    ) -> None:
+        handler_started = threading.Event()
+        release_handler = threading.Event()
+        completion_returned = threading.Event()
+
+        def handler() -> None:
+            handler_started.set()
+            assert release_handler.wait(timeout=1)
+
+        def complete_execution() -> None:
+            task_context_for_timeout.mark_execution_completed()
+            completion_returned.set()
+
+        task_context_for_timeout._abort_handlers.append(handler)
+        abort_thread = threading.Thread(
+            target=task_context_for_timeout._on_abort_detected
+        )
+        completion_thread = threading.Thread(target=complete_execution)
+
+        abort_thread.start()
+        assert handler_started.wait(timeout=1)
+        completion_thread.start()
+        assert not completion_returned.wait(timeout=0.05)
+
+        release_handler.set()
+        abort_thread.join(timeout=1)
+        completion_thread.join(timeout=1)
+
+        assert not abort_thread.is_alive()
+        assert not completion_thread.is_alive()
+        assert completion_returned.is_set()
+        assert task_context_for_timeout.interruption_status == TaskStatus.ABORTED
+
+    def test_timeout_cas_loss_does_not_claim_interruption(
+        self,
+        task_context_for_timeout: TaskContext,
+    ) -> None:
+        ctx = task_context_for_timeout
+        with (
+            patch("superset.tasks.context.threading.Timer") as timer,
+            patch(
+                "superset.commands.tasks.internal_update."
+                "InternalStatusTransitionCommand"
+            ) as transition,
+        ):
+            transition.return_value.run.return_value = False
+            ctx.start_timeout_timer(10)
+            timer.call_args.args[1]()
+
+        transition.assert_called_once()
+        assert ctx.timeout_triggered is False
+        assert ctx.interruption_status is None
+
     def test_timeout_triggers_abort_when_abortable(
         self, mock_flask_app, mock_task_abortable
     ):
@@ -273,8 +356,9 @@ class TestTimeoutTrigger:
             patch("superset.tasks.context.current_app") as mock_current_app,
             patch("superset.daos.tasks.TaskDAO") as mock_dao,
             patch(
-                "superset.commands.tasks.update.UpdateTaskCommand"
-            ) as mock_update_cmd,
+                "superset.commands.tasks.internal_update."
+                "InternalStatusTransitionCommand"
+            ) as mock_transition,
             patch("superset.tasks.manager.cache_manager") as mock_cache_manager,
         ):
             # Disable Redis by making distributed_coordination return None
@@ -283,7 +367,11 @@ class TestTimeoutTrigger:
             mock_current_app.config = mock_flask_app.config
             mock_current_app._get_current_object.return_value = mock_flask_app
             mock_dao.find_one_or_none.return_value = mock_task_abortable
+            mock_transition.return_value.run.return_value = True
 
+            # Registration updates TaskContext's authoritative property cache via a
+            # zero-read SQL write; the originally fetched ORM snapshot stays stale.
+            mock_task_abortable.properties_dict = {"is_abortable": False}
             ctx = TaskContext(mock_task_abortable)
             ctx._app = mock_flask_app
 
@@ -303,10 +391,15 @@ class TestTimeoutTrigger:
             assert ctx._timeout_triggered
             assert ctx._abort_detected
 
-            # Verify UpdateTaskCommand was called with ABORTING status
-            mock_update_cmd.assert_called()
-            call_kwargs = mock_update_cmd.call_args[1]
-            assert call_kwargs.get("status") == "aborting"
+            mock_transition.assert_called_once_with(
+                task_uuid=TEST_UUID,
+                new_status=TaskStatus.ABORTING,
+                expected_status=TaskStatus.IN_PROGRESS,
+                properties={
+                    "is_abortable": True,
+                    "error_message": "Task timed out",
+                },
+            )
 
             # Cleanup
             ctx.stop_timeout_timer()
@@ -360,7 +453,10 @@ class TestTimeoutTrigger:
         with (
             patch("superset.tasks.context.current_app") as mock_current_app,
             patch("superset.daos.tasks.TaskDAO") as mock_dao,
-            patch("superset.commands.tasks.update.UpdateTaskCommand"),
+            patch(
+                "superset.commands.tasks.internal_update."
+                "InternalStatusTransitionCommand"
+            ),
             patch("superset.tasks.manager.cache_manager") as mock_cache_manager,
         ):
             # Disable Redis by making distributed_coordination return None
@@ -456,6 +552,61 @@ class TestTaskDecoratorTimeout:
 # =============================================================================
 
 
+@pytest.mark.parametrize(
+    ("timeout_triggered", "abort_detected", "handlers_completed", "expected"),
+    [
+        (False, False, False, None),
+        (True, False, False, TaskStatus.TIMED_OUT),
+        (False, True, True, TaskStatus.ABORTED),
+        (True, True, True, TaskStatus.TIMED_OUT),
+        (False, True, False, TaskStatus.FAILURE),
+        (True, True, False, TaskStatus.FAILURE),
+    ],
+)
+def test_interruption_status_matrix(
+    task_context_for_timeout: TaskContext,
+    timeout_triggered: bool,
+    abort_detected: bool,
+    handlers_completed: bool,
+    expected: TaskStatus | None,
+) -> None:
+    task_context_for_timeout._timeout_triggered = timeout_triggered
+    task_context_for_timeout._abort_detected = abort_detected
+    task_context_for_timeout._abort_handlers_completed = handlers_completed
+
+    assert task_context_for_timeout.interruption_status == expected
+
+
+@pytest.mark.parametrize(
+    ("execution_failed", "handler_failed", "interruption", "expected"),
+    [
+        (False, False, None, TaskStatus.SUCCESS),
+        (True, False, None, TaskStatus.FAILURE),
+        (False, True, None, TaskStatus.FAILURE),
+        (True, True, TaskStatus.TIMED_OUT, TaskStatus.FAILURE),
+        (False, False, TaskStatus.TIMED_OUT, TaskStatus.TIMED_OUT),
+        (False, False, TaskStatus.ABORTED, TaskStatus.ABORTED),
+    ],
+)
+def test_terminal_status_precedence(
+    task_context_for_timeout: TaskContext,
+    execution_failed: bool,
+    handler_failed: bool,
+    interruption: TaskStatus | None,
+    expected: TaskStatus,
+) -> None:
+    task_context_for_timeout._execution_failed = execution_failed
+    task_context_for_timeout._handler_failure_detected = handler_failed
+
+    if interruption == TaskStatus.TIMED_OUT:
+        task_context_for_timeout._timeout_triggered = True
+    elif interruption == TaskStatus.ABORTED:
+        task_context_for_timeout._abort_detected = True
+        task_context_for_timeout._abort_handlers_completed = True
+
+    assert task_context_for_timeout.terminal_status == expected
+
+
 class TestTimeoutTerminalState:
     """Test timeout transitions to correct terminal state (TIMED_OUT vs FAILURE)."""
 
@@ -466,7 +617,10 @@ class TestTimeoutTerminalState:
         with (
             patch("superset.tasks.context.current_app") as mock_current_app,
             patch("superset.daos.tasks.TaskDAO") as mock_dao,
-            patch("superset.commands.tasks.update.UpdateTaskCommand"),
+            patch(
+                "superset.commands.tasks.internal_update."
+                "InternalStatusTransitionCommand"
+            ),
             patch("superset.tasks.manager.cache_manager") as mock_cache_manager,
         ):
             # Disable Redis by making distributed_coordination return None
@@ -507,7 +661,10 @@ class TestTimeoutTerminalState:
         with (
             patch("superset.tasks.context.current_app") as mock_current_app,
             patch("superset.daos.tasks.TaskDAO") as mock_dao,
-            patch("superset.commands.tasks.update.UpdateTaskCommand"),
+            patch(
+                "superset.commands.tasks.internal_update."
+                "InternalStatusTransitionCommand"
+            ),
             patch("superset.tasks.manager.cache_manager") as mock_cache_manager,
         ):
             # Disable Redis by making distributed_coordination return None
@@ -544,7 +701,10 @@ class TestTimeoutTerminalState:
         with (
             patch("superset.tasks.context.current_app") as mock_current_app,
             patch("superset.daos.tasks.TaskDAO") as mock_dao,
-            patch("superset.commands.tasks.update.UpdateTaskCommand"),
+            patch(
+                "superset.commands.tasks.internal_update."
+                "InternalStatusTransitionCommand"
+            ),
             patch("superset.tasks.manager.cache_manager") as mock_cache_manager,
         ):
             # Disable Redis by making distributed_coordination return None
@@ -581,7 +741,10 @@ class TestTimeoutTerminalState:
         with (
             patch("superset.tasks.context.current_app") as mock_current_app,
             patch("superset.daos.tasks.TaskDAO") as mock_dao,
-            patch("superset.commands.tasks.update.UpdateTaskCommand"),
+            patch(
+                "superset.commands.tasks.internal_update."
+                "InternalStatusTransitionCommand"
+            ),
             patch("superset.tasks.manager.cache_manager") as mock_cache_manager,
         ):
             # Disable Redis by making distributed_coordination return None

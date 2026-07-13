@@ -30,6 +30,7 @@ class TaskStatus(str, Enum):
 
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
+    FINALIZING = "finalizing"  # Task body ended; publication/cleanup is running
     SUCCESS = "success"
     FAILURE = "failure"
     ABORTING = "aborting"  # Abort/timeout requested, handlers running
@@ -201,6 +202,20 @@ class TaskContext(ABC):
             ctx.on_cleanup(lambda: logger.info("Task ended"))
 
         :param handler: Cleanup function to register
+        :returns: The handler (for decorator compatibility)
+        """
+        ...
+
+    @abstractmethod
+    def on_finalize(self, handler: Callable[[], None]) -> Callable[[], None]:
+        """
+        Register a success-only finalizer that runs after execution is fenced.
+
+        Finalizers run after the task atomically transitions to ``FINALIZING``
+        and before cleanup handlers. They are skipped after execution failure,
+        cancellation, or timeout. A finalizer failure makes the task fail.
+
+        :param handler: Finalization function to register
         :returns: The handler (for decorator compatibility)
         """
         ...

@@ -32,7 +32,10 @@ task_type_description = (
     "The type of task (e.g., 'sql_execution', 'thumbnail_generation')"
 )
 task_name_description = "Human-readable name for the task"
-status_description = "Current status of the task"
+status_description = (
+    "Current task status: pending, in_progress, finalizing, aborting, success, "
+    "failure, aborted, or timed_out"
+)
 created_on_description = "Timestamp when the task was created"
 changed_on_description = "Timestamp when the task was last updated"
 started_at_description = "Timestamp when the task started execution"

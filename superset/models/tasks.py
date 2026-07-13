@@ -224,8 +224,8 @@ class Task(CoreTask, AuditMixinNullable, Model):
                 self.ended_at = now
             # Update dedup_key to UUID to free up the slot for new tasks
             self.dedup_key = get_finished_dedup_key(self.uuid)
-        # Note: ABORTING status doesn't set ended_at yet - that happens when
-        # the task transitions to ABORTED after handlers complete
+        # Active FINALIZING/ABORTING states retain the execution slot and do not
+        # set ended_at. The terminal transition records completion.
 
     @property
     def is_pending(self) -> bool:
@@ -235,7 +235,10 @@ class Task(CoreTask, AuditMixinNullable, Model):
     @property
     def is_running(self) -> bool:
         """Check if task is currently running."""
-        return self.status == TaskStatus.IN_PROGRESS.value
+        return self.status in {
+            TaskStatus.IN_PROGRESS.value,
+            TaskStatus.FINALIZING.value,
+        }
 
     @property
     def is_finished(self) -> bool:
@@ -253,7 +256,7 @@ class Task(CoreTask, AuditMixinNullable, Model):
         Get task duration in seconds.
 
         - Finished tasks: Time from started_at to ended_at (None if never started)
-        - Running/aborting tasks: Time from started_at to now
+        - Running/finalizing/aborting tasks: Time from started_at to now
         - Pending tasks: Time from created_on to now (queue time)
 
         Note: started_at/ended_at are stored in UTC, but created_on from

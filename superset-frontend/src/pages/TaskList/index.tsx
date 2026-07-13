@@ -464,6 +464,7 @@ function TaskList({ addDangerToast, addSuccessToast, user }: TaskListProps) {
             TaskStatus.Failure,
             TaskStatus.Aborted,
             TaskStatus.Aborting,
+            TaskStatus.Finalizing,
             TaskStatus.TimedOut,
           ].includes(original.status as TaskStatus);
 
@@ -548,6 +549,7 @@ function TaskList({ addDangerToast, addSuccessToast, user }: TaskListProps) {
         selects: [
           { label: t('Pending'), value: TaskStatus.Pending },
           { label: t('In Progress'), value: TaskStatus.InProgress },
+          { label: t('Finalizing'), value: TaskStatus.Finalizing },
           { label: t('Success'), value: TaskStatus.Success },
           { label: t('Failed'), value: TaskStatus.Failure },
           { label: t('Timed Out'), value: TaskStatus.TimedOut },

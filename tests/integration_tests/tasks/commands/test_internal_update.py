@@ -291,7 +291,7 @@ def test_status_transition_atomic_compare_and_swap(
         # 2. FAILURE CASE: Try wrong expected status (should fail, status unchanged)
         result = InternalStatusTransitionCommand(
             task_uuid=task.uuid,
-            new_status=TaskStatus.SUCCESS,
+            new_status=TaskStatus.IN_PROGRESS,
             expected_status=TaskStatus.PENDING,  # Wrong! Current is IN_PROGRESS
         ).run()
         assert result is False
@@ -304,17 +304,18 @@ def test_status_transition_atomic_compare_and_swap(
 
         result = InternalStatusTransitionCommand(
             task_uuid=task.uuid,
-            new_status=TaskStatus.FAILURE,
-            expected_status=[TaskStatus.IN_PROGRESS, TaskStatus.ABORTING],
+            new_status=TaskStatus.ABORTED,
+            expected_status=[TaskStatus.PENDING, TaskStatus.ABORTING],
             properties={"error_message": "Test error"},
         ).run()
         assert result is True
         db.session.refresh(task)
-        assert task.status == TaskStatus.FAILURE.value
+        assert task.status == TaskStatus.ABORTED.value
         assert task.properties_dict.get("error_message") == "Test error"
 
-        # 4. ENDED_AT: Reset to IN_PROGRESS and test ended_at timestamp
+        # 4. ENDED_AT: Reset to FINALIZING and test ended_at timestamp
         task.set_status(TaskStatus.IN_PROGRESS)
+        task.set_status(TaskStatus.FINALIZING)
         task.ended_at = None
         db.session.commit()
         assert task.ended_at is None
@@ -322,7 +323,7 @@ def test_status_transition_atomic_compare_and_swap(
         result = InternalStatusTransitionCommand(
             task_uuid=task.uuid,
             new_status=TaskStatus.SUCCESS,
-            expected_status=TaskStatus.IN_PROGRESS,
+            expected_status=TaskStatus.FINALIZING,
             set_ended_at=True,
         ).run()
         assert result is True
@@ -354,7 +355,7 @@ def test_status_transition_prevents_race_condition(
     """Test that conditional update prevents overwriting concurrent abort.
 
     This is the key race condition fix: if task is aborted concurrently,
-    the executor's attempt to set SUCCESS should fail (return False),
+    the executor's attempt to claim FINALIZING should fail (return False),
     preserving the ABORTING state.
     """
     admin = get_user("admin")
@@ -376,10 +377,10 @@ def test_status_transition_prevents_race_condition(
         task.set_status(TaskStatus.ABORTING)
         db.session.commit()
 
-        # Executor tries to set SUCCESS (expecting IN_PROGRESS) - stale expectation
+        # Executor tries to claim FINALIZING with a stale IN_PROGRESS expectation.
         result = InternalStatusTransitionCommand(
             task_uuid=task.uuid,
-            new_status=TaskStatus.SUCCESS,
+            new_status=TaskStatus.FINALIZING,
             expected_status=TaskStatus.IN_PROGRESS,
         ).run()
 

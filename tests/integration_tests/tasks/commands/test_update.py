@@ -43,6 +43,7 @@ def test_update_task_success(app_context, get_user, login_as) -> None:
     )
     task.created_by = admin
     task.set_status(TaskStatus.IN_PROGRESS)
+    task.set_status(TaskStatus.FINALIZING)
     db.session.commit()
 
     try:
@@ -159,6 +160,40 @@ def test_update_task_payload(app_context, get_user, login_as) -> None:
         db.session.commit()
 
 
+def test_update_task_rejects_status_edge_outside_state_graph(
+    app_context,
+    get_user,
+    login_as,
+) -> None:
+    """Status updates cannot bypass the framework transition policy."""
+    admin = get_user("admin")
+    login_as("admin")
+    task = TaskDAO.create_task(
+        task_type="test_type",
+        task_key="invalid_status_edge",
+        scope=TaskScope.PRIVATE,
+        user_id=admin.id,
+    )
+    task.created_by = admin
+    task.set_status(TaskStatus.IN_PROGRESS)
+    db.session.commit()
+
+    try:
+        command = UpdateTaskCommand(
+            task_uuid=task.uuid,
+            status=TaskStatus.SUCCESS.value,
+        )
+
+        with pytest.raises(ValueError, match="Invalid GTF status transition"):
+            command.run()
+
+        db.session.refresh(task)
+        assert task.status == TaskStatus.IN_PROGRESS.value
+    finally:
+        db.session.delete(task)
+        db.session.commit()
+
+
 def test_update_all_supported_fields(app_context, get_user, login_as) -> None:
     """Test updating all supported task fields
     (status, error, progress, abortable, timeout)"""
@@ -175,6 +210,7 @@ def test_update_all_supported_fields(app_context, get_user, login_as) -> None:
     )
     task.created_by = admin
     task.set_status(TaskStatus.IN_PROGRESS)
+    task.set_status(TaskStatus.FINALIZING)
     db.session.commit()
 
     try:

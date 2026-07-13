@@ -22,7 +22,7 @@ from functools import partial
 from typing import Any, TYPE_CHECKING
 from uuid import UUID
 
-from superset_core.tasks.types import TaskProperties
+from superset_core.tasks.types import TaskProperties, TaskStatus
 
 from superset import security_manager
 from superset.commands.base import BaseCommand
@@ -32,6 +32,7 @@ from superset.commands.tasks.exceptions import (
     TaskUpdateFailedError,
 )
 from superset.exceptions import SupersetSecurityException
+from superset.tasks.constants import ensure_allowed_status_transition
 from superset.tasks.locks import task_lock
 from superset.tasks.utils import get_active_dedup_key
 from superset.utils.decorators import on_error, transaction
@@ -150,7 +151,10 @@ class UpdateTaskCommand(BaseCommand):
 
         # Update status via set_status() for proper timestamp handling
         if self._status is not None:
-            self._model.set_status(self._status)
+            current_status = TaskStatus(self._model.status)
+            target_status = TaskStatus(self._status)
+            ensure_allowed_status_transition(current_status, target_status)
+            self._model.set_status(target_status)
         if self._started_at is not None:
             self._model.started_at = self._started_at
         if self._ended_at is not None:
