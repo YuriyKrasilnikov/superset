@@ -16,17 +16,22 @@
 # under the License.
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import nullcontext
 from typing import Any, TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
-from flask import Flask, g, Response
+from flask import Flask, g, has_request_context, request, Response
+from pytest_mock import MockerFixture
 
 from superset.charts.data.api import ChartDataRestApi
 from superset.charts.data.dashboard_filter_context import (
     apply_dashboard_filter_context,
 )
 from superset.commands.chart.data.get_data_command import ChartDataExecutionOptions
+from superset.commands.chart.data.streaming_export_command import (
+    StreamingExportIneligibility,
+)
 from superset.common.chart_data import ChartDataResultFormat, ChartDataResultType
 from superset.common.chart_data_timing import (
     CacheWriteOutcome,
@@ -332,3 +337,100 @@ def test_async_cache_lookup_uses_typed_execution_options() -> None:
         ChartDataExecutionOptions(force_cached=True)
     )
     send_response.assert_called_once_with(execution)
+
+
+def test_direct_export_does_not_materialize_chart_data(
+    app: SupersetApp,
+    mocker: MockerFixture,
+) -> None:
+    """An eligible direct export executes only the streaming command."""
+    api = ChartDataRestApi.__new__(ChartDataRestApi)
+    command = MagicMock()
+    command.query_context.result_format = ChartDataResultFormat.CSV
+    stream_command = mocker.patch(
+        "superset.charts.data.api.StreamingCSVExportCommand"
+    ).return_value
+    stream_command.prepare.return_value.eligible = True
+    expected_response = Response("csv")
+    stats_logger = MagicMock()
+    mocker.patch.dict(app.config, {"STATS_LOGGER": stats_logger})
+    mocker.patch.object(api, "_can_export_data", return_value=True)
+    mocker.patch.object(api, "_should_attempt_direct_streaming", return_value=True)
+    create_response = mocker.patch.object(
+        api, "_create_streaming_csv_response", return_value=expected_response
+    )
+
+    with app.test_request_context("/api/v1/chart/data", method="POST"):
+        response = api._get_data_response(command, expected_rows=100_000)
+
+    assert response is expected_response
+    command.execute.assert_not_called()
+    stats_logger.incr.assert_called_once_with("chart_data.export.transport.direct")
+    create_response.assert_called_once_with(
+        stream_command,
+        None,
+        filename=None,
+        expected_rows=100_000,
+    )
+
+
+def test_direct_export_stream_preserves_request_context(
+    app: SupersetApp,
+) -> None:
+    """The streaming iterator retains request state used for impersonation."""
+    api = ChartDataRestApi.__new__(ChartDataRestApi)
+    command = MagicMock()
+
+    def chunks() -> Iterator[bytes]:
+        assert has_request_context()
+        assert request.path == "/api/v1/chart/data"
+        assert g.streaming_user == "analyst"
+        yield b"value\n1\n"
+
+    command.run.return_value = chunks()
+
+    with app.test_request_context("/api/v1/chart/data", method="POST"):
+        g.streaming_user = "analyst"
+        response = api._create_streaming_csv_response(
+            command,
+            filename="export.csv",
+        )
+        assert b"".join(response.response) == b"value\n1\n"
+
+    command.validate.assert_called_once_with()
+
+
+def test_ineligible_direct_export_materializes_once(
+    app: SupersetApp,
+    mocker: MockerFixture,
+) -> None:
+    """An ineligible large export falls back without a second source query."""
+    api = ChartDataRestApi.__new__(ChartDataRestApi)
+    command = MagicMock()
+    command.query_context.result_format = ChartDataResultFormat.CSV
+    stream_command = mocker.patch(
+        "superset.charts.data.api.StreamingCSVExportCommand"
+    ).return_value
+    stream_command.prepare.return_value.eligible = False
+    stream_command.prepare.return_value.ineligibility = (
+        StreamingExportIneligibility.RESULT_TRANSFORM
+    )
+    expected_response = Response("materialized")
+    stats_logger = MagicMock()
+    mocker.patch.dict(app.config, {"STATS_LOGGER": stats_logger})
+    mocker.patch.object(api, "_can_export_data", return_value=True)
+    mocker.patch.object(api, "_should_attempt_direct_streaming", return_value=True)
+    send_response = mocker.patch.object(
+        api, "_send_chart_response", return_value=expected_response
+    )
+
+    with app.test_request_context("/api/v1/chart/data", method="POST"):
+        response = api._get_data_response(command, expected_rows=100_000)
+
+    assert response is expected_response
+    command.execute.assert_called_once()
+    send_response.assert_called_once()
+    assert stats_logger.incr.call_args_list == [
+        mocker.call("chart_data.export.transport.materialized"),
+        mocker.call("chart_data.export.direct_ineligible.result_transform"),
+    ]

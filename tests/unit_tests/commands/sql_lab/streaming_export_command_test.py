@@ -20,14 +20,20 @@ from decimal import Decimal
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from flask import current_app
 from pytest_mock import MockerFixture
 
 from superset.commands.sql_lab.streaming_export_command import (
     StreamingSqlResultExportCommand,
 )
+from superset.db_engine_specs.base import BaseEngineSpec
 from superset.errors import SupersetErrorType
 from superset.exceptions import SupersetErrorException, SupersetSecurityException
+from superset.models.core import Database
+from superset.result_set import SupersetResultSet
 from superset.sqllab.limiting_factor import LimitingFactor
+from superset.superset_typing import DbapiDescription
+from superset.utils import csv as csv_utils
 
 
 def _setup_sqllab_mocks(
@@ -61,6 +67,8 @@ def mock_query():
     query.database = MagicMock()
     query.database.db_engine_spec = MagicMock()
     query.database.db_engine_spec.engine = "postgresql"
+    query.database.db_engine_spec.requires_column_value_normalization = False
+    query.database.post_process_df.side_effect = lambda dataframe: dataframe
     query.raise_for_access = MagicMock()
     return query
 
@@ -85,7 +93,6 @@ def test_streaming_sql_result_export_command_init():
     assert command._client_id == "client_123"
     assert command._chunk_size == 500
     assert command._query is None
-    assert command._current_app is not None
 
 
 def test_streaming_sql_result_export_command_default_chunk_size():
@@ -166,11 +173,10 @@ def test_csv_generation_with_select_sql(mocker, mock_query, mock_result_proxy):
     command = StreamingSqlResultExportCommand("test_client_123", chunk_size=2)
     command.validate()
 
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
+    generator = command.run()
     chunks = list(generator)
 
-    csv_data = "".join(chunks)
+    csv_data = b"".join(chunks).decode("utf-8-sig")
     lines = [line.strip() for line in csv_data.strip().split("\n")]
 
     assert len(lines) == 4
@@ -218,12 +224,12 @@ def test_csv_generation_with_executed_sql_and_limit(
     command = StreamingSqlResultExportCommand("test_client_123", chunk_size=10)
     command.validate()
 
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
-    csv_data = "".join(generator)
+    generator = command.run()
+    csv_data = b"".join(generator).decode("utf-8-sig")
 
     lines = [line.strip() for line in csv_data.strip().split("\n")]
     assert len(lines) == 3  # header + 2 rows (limit - 1)
+    mock_result.fetchmany.assert_called_once_with(2)
 
 
 def test_csv_generation_with_special_characters(mocker, mock_query):
@@ -253,9 +259,8 @@ def test_csv_generation_with_special_characters(mocker, mock_query):
     command = StreamingSqlResultExportCommand("test_client_123")
     command.validate()
 
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
-    csv_data = "".join(generator)
+    generator = command.run()
+    csv_data = b"".join(generator).decode("utf-8-sig")
 
     assert '"Text with ""quotes"""' in csv_data  # Quotes doubled
     assert "Line\nbreak" in csv_data
@@ -300,9 +305,8 @@ def test_limiting_factor_dropdown(mocker, mock_query):
         command = StreamingSqlResultExportCommand("test_client_123", chunk_size=200)
         command.validate()
 
-        csv_generator_callable = command.run()
-        generator = csv_generator_callable()
-        csv_data = "".join(generator)
+        generator = command.run()
+        csv_data = b"".join(generator).decode("utf-8-sig")
 
         lines = [line.strip() for line in csv_data.strip().split("\n")]
         assert len(lines) == 101
@@ -345,9 +349,8 @@ def test_limiting_factor_query_and_dropdown(mocker, mock_query):
         command = StreamingSqlResultExportCommand("test_client_123", chunk_size=100)
         command.validate()
 
-        csv_generator_callable = command.run()
-        generator = csv_generator_callable()
-        csv_data = "".join(generator)
+        generator = command.run()
+        csv_data = b"".join(generator).decode("utf-8-sig")
 
         lines = [line.strip() for line in csv_data.strip().split("\n")]
         assert len(lines) == 51
@@ -377,9 +380,8 @@ def test_empty_result_set(mocker, mock_query):
     command = StreamingSqlResultExportCommand("test_client_123")
     command.validate()
 
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
-    csv_data = "".join(generator)
+    generator = command.run()
+    csv_data = b"".join(generator).decode("utf-8-sig")
 
     lines = [line.strip() for line in csv_data.strip().split("\n")]
     assert len(lines) == 1
@@ -404,11 +406,10 @@ def test_error_handling_yields_error_marker(mocker, mock_query):
     command = StreamingSqlResultExportCommand("test_client_123")
     command.validate()
 
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
+    generator = command.run()
     chunks = list(generator)
 
-    error_output = "".join(chunks)
+    error_output = b"".join(chunks).decode("utf-8-sig")
     assert "__STREAM_ERROR__" in error_output
     assert "Export failed" in error_output
 
@@ -435,8 +436,7 @@ def test_connection_is_closed_after_streaming(mocker, mock_query, mock_result_pr
     command = StreamingSqlResultExportCommand("test_client_123")
     command.validate()
 
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
+    generator = command.run()
     list(generator)
 
     # With context managers, __exit__ is called to cleanup the connection
@@ -465,8 +465,7 @@ def test_streaming_execution_options_enabled(mocker, mock_query, mock_result_pro
     command = StreamingSqlResultExportCommand("test_client_123")
     command.validate()
 
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
+    generator = command.run()
     list(generator)
 
     mock_connection.execution_options.assert_called_once_with(stream_results=True)
@@ -495,14 +494,13 @@ def test_completion_logging(mock_logger, mocker, mock_query, mock_result_proxy):
     command = StreamingSqlResultExportCommand("test_client_123")
     command.validate()
 
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
+    generator = command.run()
     list(generator)
 
     assert mock_logger.info.called
-    log_message = str(mock_logger.info.call_args)
-    assert "Streaming CSV completed" in log_message
-    assert "rows" in log_message
+    log_messages = " ".join(str(call) for call in mock_logger.info.call_args_list)
+    assert "Streaming CSV query completed" in log_messages
+    assert "Streaming CSV response completed" in log_messages
 
 
 def test_null_values_handling(mocker, mock_query):
@@ -532,9 +530,8 @@ def test_null_values_handling(mocker, mock_query):
     command = StreamingSqlResultExportCommand("test_client_123")
     command.validate()
 
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
-    csv_data = "".join(generator)
+    generator = command.run()
+    csv_data = b"".join(generator).decode("utf-8-sig")
 
     lines = [line.strip() for line in csv_data.strip().split("\n")]
     assert len(lines) == 4
@@ -572,7 +569,7 @@ def test_catalog_and_schema_passed_to_engine(mocker, mock_query, mock_result_pro
     command = StreamingSqlResultExportCommand("test_client_123")
     command.validate()
 
-    list(command.run()())
+    list(command.run())
 
     mock_query.database.get_sqla_engine.assert_called_once_with(
         catalog="my_catalog",
@@ -618,9 +615,8 @@ def test_csv_export_config_custom_separator(mocker, mock_query) -> None:
     command = StreamingSqlResultExportCommand("test_client_123")
     command.validate()
 
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
-    csv_data = "".join(generator)
+    generator = command.run()
+    csv_data = b"".join(generator).decode()
 
     # With sep=";", columns should be separated by semicolon
     assert "id;name" in csv_data
@@ -666,9 +662,8 @@ def test_csv_export_config_custom_decimal(mocker, mock_query) -> None:
     command = StreamingSqlResultExportCommand("test_client_123")
     command.validate()
 
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
-    csv_data = "".join(generator)
+    generator = command.run()
+    csv_data = b"".join(generator).decode()
 
     # With decimal=",", float values should use comma
     assert "12,34" in csv_data
@@ -712,9 +707,8 @@ def test_csv_export_config_combined_sep_and_decimal(mocker, mock_query) -> None:
     command = StreamingSqlResultExportCommand("test_client_123")
     command.validate()
 
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
-    csv_data = "".join(generator)
+    generator = command.run()
+    csv_data = b"".join(generator).decode()
 
     # Verify header uses semicolon separator
     assert "id;name;price" in csv_data
@@ -723,13 +717,9 @@ def test_csv_export_config_combined_sep_and_decimal(mocker, mock_query) -> None:
     assert ";149,5" in csv_data
 
 
-def test_csv_export_config_custom_decimal_for_decimal_type(mocker, mock_query) -> None:
+def test_csv_export_config_matches_pandas_for_decimal_type(mocker, mock_query) -> None:
     """
-    Streaming CSV export must respect the custom decimal separator for
-    ``decimal.Decimal`` values too — SQLAlchemy commonly returns NUMERIC /
-    DECIMAL columns as ``Decimal`` rather than ``float``.
-
-    Regression test for GitHub issue #32371 / PR #38170 review feedback.
+    Streaming CSV follows materialized pandas semantics for Decimal objects.
     """
     mock_query.select_sql = "SELECT * FROM test"
 
@@ -761,13 +751,59 @@ def test_csv_export_config_custom_decimal_for_decimal_type(mocker, mock_query) -
     command = StreamingSqlResultExportCommand("test_client_123")
     command.validate()
 
-    csv_generator_callable = command.run()
-    generator = csv_generator_callable()
-    csv_data = "".join(generator)
+    generator = command.run()
+    csv_data = b"".join(generator).decode()
 
-    # Decimal values must be formatted with the custom separator, not left
-    # with the default ``.`` which would slip through a ``float``-only check.
-    assert "1;12,34" in csv_data
-    assert "2;56,78" in csv_data
-    assert "12.34" not in csv_data
-    assert "56.78" not in csv_data
+    # pandas applies decimal to float columns, not object-backed Decimal values.
+    # Streaming must not invent a different representation.
+    assert "1;12.34" in csv_data
+    assert "2;56.78" in csv_data
+
+
+def test_streaming_bytes_match_materialized_pipeline_across_chunks(
+    mocker: MockerFixture,
+    mock_query: MagicMock,
+) -> None:
+    """Chunk boundaries do not change canonical CSV bytes."""
+    mock_query.select_sql = "SELECT * FROM test"
+    mock_query.database.db_engine_spec = BaseEngineSpec
+    mock_query.database.post_process_df.side_effect = Database.post_process_df
+    rows = [
+        (1, "v1.2", Decimal("12.34"), None, {"key": "value"}),
+        (2, "=1+1", Decimal("56.78"), float("nan"), [1, 2]),
+    ]
+    description: DbapiDescription = [
+        (name, "", None, None, None, None, False)
+        for name in ("id", "label", "amount", "missing", "nested")
+    ]
+    result = MagicMock()
+    result.keys.return_value = [column[0] for column in description]
+    result.cursor.description = description
+    result.fetchmany.side_effect = [[rows[0]], [rows[1]], []]
+    _setup_sqllab_mocks(mocker, mock_query)
+    connection = MagicMock()
+    connection.execution_options.return_value.execute.return_value = result
+    connection.__enter__.return_value = connection
+    engine = MagicMock()
+    engine.connect.return_value = connection
+    mock_query.database.get_sqla_engine.return_value.__enter__.return_value = engine
+
+    command = StreamingSqlResultExportCommand("test_client_123", chunk_size=1)
+    command.validate()
+    streamed = b"".join(command.run())
+
+    dataframe = SupersetResultSet(
+        rows,
+        description,
+        BaseEngineSpec,
+    ).to_pandas_df()
+    dataframe = Database.post_process_df(dataframe)
+    config = current_app.config["CSV_EXPORT"]
+    materialized = csv_utils.df_to_escaped_csv(
+        dataframe,
+        index=False,
+        **config,
+    ).encode(config.get("encoding", "utf-8"))
+
+    assert streamed == materialized
+    assert streamed.count(b"\xef\xbb\xbf") == 1

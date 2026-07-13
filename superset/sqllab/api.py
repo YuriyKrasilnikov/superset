@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Any, cast, Optional
 from urllib import parse
 
-from flask import current_app as app, request, Response
+from flask import current_app as app, request, Response, stream_with_context
 from flask_appbuilder import permission_name
 from flask_appbuilder.api import expose, protect, rison as parse_rison, safe
 from flask_appbuilder.models.sqla.interface import SQLAInterface
@@ -431,16 +431,15 @@ class SqlLabRestApi(BaseSupersetApi):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = secure_filename(f"sqllab_{client_id}_{timestamp}.csv")
 
-        # Get the callable that returns the generator
-        csv_generator_callable = command.run()
+        csv_generator = command.run()
 
         # Get encoding from config
         encoding = app.config.get("CSV_EXPORT", {}).get("encoding", "utf-8")
 
         # Create response with streaming headers
         response = Response(
-            csv_generator_callable(),  # Call the callable to get generator
-            mimetype=f"text/csv; charset={encoding}",
+            stream_with_context(csv_generator),
+            content_type=f"text/csv; charset={encoding}",
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "Cache-Control": "no-cache",

@@ -21,7 +21,14 @@ import logging
 from datetime import datetime
 from typing import Any, Callable, TYPE_CHECKING
 
-from flask import current_app as app, g, make_response, request, Response
+from flask import (
+    current_app as app,
+    g,
+    make_response,
+    request,
+    Response,
+    stream_with_context,
+)
 from flask_appbuilder.api import expose, protect
 from flask_babel import gettext as _
 from marshmallow import ValidationError
@@ -45,6 +52,11 @@ from superset.charts.schemas import ChartDataQueryContextSchema
 from superset.commands.chart.data.create_async_job_command import (
     CreateAsyncChartDataJobCommand,
 )
+from superset.commands.chart.data.export_planner import (
+    ChartDataExportMode,
+    ChartDataExportPlan,
+    ChartDataExportPlanner,
+)
 from superset.commands.chart.data.get_data_command import (
     ChartDataCommand,
     ChartDataExecutionOptions,
@@ -64,7 +76,11 @@ from superset.common.chart_data_timing import (
 from superset.connectors.sqla.models import BaseDatasource
 from superset.constants import CACHE_DISABLED_TIMEOUT
 from superset.daos.exceptions import DatasourceNotFound
-from superset.exceptions import QueryObjectValidationError, SupersetSecurityException
+from superset.exceptions import (
+    QueryObjectValidationError,
+    SupersetException,
+    SupersetSecurityException,
+)
 from superset.extensions import event_logger
 from superset.models.sql_lab import Query
 from superset.utils import json
@@ -506,25 +522,13 @@ class ChartDataRestApi(ChartRestApi):
 
         if result_format in ChartDataResultFormat.table_like():
             # Verify user has permission to export file
-            if is_feature_enabled("GRANULAR_EXPORT_CONTROLS"):
-                has_export_perm = security_manager.can_access(
-                    "can_export_data", "Superset"
-                )
-            else:
-                has_export_perm = security_manager.can_access("can_csv", "Superset")
-            if not has_export_perm:
+            if not self._can_export_data():
                 return self.response_403()
 
             if not result["queries"]:
                 return self.response_400(_("Empty query result"))
 
             is_csv_format = result_format == ChartDataResultFormat.CSV
-
-            # Check if we should use streaming for large datasets
-            if is_csv_format and self._should_use_streaming(result, form_data):
-                return self._create_streaming_csv_response(
-                    result, form_data, filename=filename, expected_rows=expected_rows
-                )
 
             if len(result["queries"]) == 1:
                 # return single query results
@@ -611,6 +615,43 @@ class ChartDataRestApi(ChartRestApi):
         dashboard_filter_context: DashboardFilterContext | None = None,
     ) -> Response:
         """Get data response and optionally log is_cached information."""
+        query_context = command.query_context
+        if (
+            query_context.result_format in ChartDataResultFormat.table_like()
+            and not self._can_export_data()
+        ):
+            return self.response_403()
+
+        try:
+            plan = ChartDataExportPlanner(
+                query_context,
+                optimize_requested=self._should_attempt_direct_streaming(
+                    query_context,
+                    form_data,
+                    expected_rows,
+                ),
+                direct_command_factory=lambda: StreamingCSVExportCommand(
+                    query_context,
+                    chunk_size=1024,
+                ),
+            ).plan()
+            if query_context.result_format == ChartDataResultFormat.CSV:
+                self._record_export_plan(plan)
+            if (
+                plan.mode == ChartDataExportMode.DIRECT
+                and plan.direct_command is not None
+            ):
+                return self._create_streaming_csv_response(
+                    plan.direct_command,
+                    form_data,
+                    filename=filename,
+                    expected_rows=expected_rows,
+                )
+        except SupersetSecurityException:
+            return self.response_403()
+        except (QueryObjectValidationError, SupersetException) as exc:
+            return self.response_400(message=str(exc))
+
         try:
             with chart_timing_phase("query"):
                 result = command.execute(
@@ -696,56 +737,59 @@ class ChartDataRestApi(ChartRestApi):
         except KeyError as ex:
             raise ValidationError("Request is incorrect") from ex
 
-    def _should_use_streaming(
-        self, result: dict[Any, Any], form_data: dict[str, Any] | None = None
-    ) -> bool:
-        """Determine if streaming should be used based on actual row count threshold."""
-        query_context = result["query_context"]
-        result_format = query_context.result_format
+    @staticmethod
+    def _can_export_data() -> bool:
+        if is_feature_enabled("GRANULAR_EXPORT_CONTROLS"):
+            return security_manager.can_access("can_export_data", "Superset")
+        return security_manager.can_access("can_csv", "Superset")
 
-        # Only support CSV streaming currently
-        if result_format.lower() != "csv":
+    def _should_attempt_direct_streaming(
+        self,
+        query_context: QueryContext,
+        form_data: dict[str, Any] | None = None,
+        expected_rows: int | None = None,
+    ) -> bool:
+        """Use row estimates only to select the pre-execution planning path."""
+        if query_context.result_format != ChartDataResultFormat.CSV:
             return False
 
-        # Get streaming threshold from config
         threshold = app.config.get("CSV_STREAMING_ROW_THRESHOLD", 100000)
+        row_estimate = expected_rows
+        if row_estimate is None:
+            candidate_form_data = form_data or query_context.form_data or {}
+            row_limit = candidate_form_data.get("row_limit")
+            try:
+                row_estimate = int(row_limit) if row_limit is not None else None
+            except (TypeError, ValueError):
+                row_estimate = None
+        return row_estimate is not None and row_estimate >= threshold
 
-        # Extract actual row count (same logic as frontend)
-        actual_row_count: int | None = None
-        viz_type = form_data.get("viz_type") if form_data else None
-
-        # For table viz, try to get actual row count from query results
-        if viz_type == "table" and result.get("queries"):
-            # Check if we have rowcount in the second query result (like frontend does)
-            queries = result.get("queries", [])
-            if len(queries) > 1 and queries[1].get("data"):
-                data = queries[1]["data"]
-                if isinstance(data, list) and len(data) > 0:
-                    rowcount = data[0].get("rowcount")
-                    actual_row_count = int(rowcount) if rowcount else None
-
-        # Fallback to row_limit if actual count not available
-        if actual_row_count is None:
-            if form_data and "row_limit" in form_data:
-                row_limit = form_data.get("row_limit", 0)
-                actual_row_count = int(row_limit) if row_limit else 0
-            elif query_context.form_data and "row_limit" in query_context.form_data:
-                row_limit = query_context.form_data.get("row_limit", 0)
-                actual_row_count = int(row_limit) if row_limit else 0
-
-        # Use streaming if row count meets or exceeds threshold
-        return actual_row_count is not None and actual_row_count >= threshold
+    @staticmethod
+    def _record_export_plan(plan: ChartDataExportPlan) -> None:
+        """Emit bounded transport diagnostics without query or user content."""
+        stats_logger = app.config["STATS_LOGGER"]
+        stats_logger.incr(f"chart_data.export.transport.{plan.mode.value}")
+        ineligibility = (
+            plan.direct_ineligibility.value
+            if plan.direct_ineligibility is not None
+            else None
+        )
+        logger.info(
+            "Chart CSV export plan selected: mode=%s, direct_ineligibility=%s",
+            plan.mode.value,
+            ineligibility,
+        )
+        if ineligibility is not None:
+            stats_logger.incr(f"chart_data.export.direct_ineligible.{ineligibility}")
 
     def _create_streaming_csv_response(
         self,
-        result: dict[Any, Any],
+        command: StreamingCSVExportCommand,
         form_data: dict[str, Any] | None = None,
         filename: str | None = None,
         expected_rows: int | None = None,
     ) -> Response:
         """Create a streaming CSV response for large datasets."""
-        query_context = result["query_context"]
-
         # Use filename from frontend if provided, otherwise generate one
         if not filename:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -767,21 +811,13 @@ class ChartDataRestApi(ChartRestApi):
         if expected_rows:
             logger.info("Using expected_rows from frontend: %d", expected_rows)
 
-        # Execute streaming command
-        # TODO: Make chunk size configurable via SUPERSET_CONFIG
-        chunk_size = 1024
-        command = StreamingCSVExportCommand(query_context, chunk_size)
         command.validate()
 
-        # Get the callable that returns the generator
-        csv_generator_callable = command.run()
-
-        # Get encoding from config
+        csv_generator = command.run()
         encoding = app.config.get("CSV_EXPORT", {}).get("encoding", "utf-8")
 
-        # Create response with streaming headers
         response = Response(
-            csv_generator_callable(),  # Call the callable to get generator
+            stream_with_context(csv_generator),
             # Use content_type (not mimetype) so the charset is set verbatim;
             # passing a charset via mimetype makes Werkzeug append a second
             # charset, producing a malformed doubled Content-Type header.

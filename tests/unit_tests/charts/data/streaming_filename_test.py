@@ -14,23 +14,22 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
+from flask import Flask
 
 
 def _build_response(filename: str | None):
     from superset.charts.data.api import ChartDataRestApi
 
     api = ChartDataRestApi.__new__(ChartDataRestApi)
-    result = {"query_context": MagicMock()}
-
-    with patch(
-        "superset.charts.data.api.StreamingCSVExportCommand"
-    ) as mock_command_cls:
-        mock_command = mock_command_cls.return_value
-        mock_command.run.return_value = lambda: iter([b"a,b\n"])
-        return api._create_streaming_csv_response(result, filename=filename)
+    command = MagicMock()
+    command.run.return_value = iter([b"\xef\xbb\xbfa,b\n"])
+    app = Flask(__name__)
+    app.config["CSV_EXPORT"] = {"encoding": "utf-8-sig"}
+    with app.test_request_context():
+        return api._create_streaming_csv_response(command, filename=filename)
 
 
 @pytest.mark.parametrize(
@@ -57,3 +56,9 @@ def test_blank_filename_falls_back_to_default() -> None:
     response = _build_response("...")
     disposition = response.headers["Content-Disposition"]
     assert 'filename="export.csv"' in disposition
+
+
+def test_streaming_response_honors_utf8_sig_encoding() -> None:
+    response = _build_response("report.csv")
+
+    assert b"".join(response.response).startswith(b"\xef\xbb\xbf")

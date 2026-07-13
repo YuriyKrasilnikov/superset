@@ -1441,10 +1441,10 @@ ALLOWED_EXTENSIONS = {*EXCEL_EXTENSIONS, *CSV_EXTENSIONS, *COLUMNAR_EXTENSIONS}
 # note: index option should not be overridden
 CSV_EXPORT = {"encoding": "utf-8-sig"}
 
-# CSV Streaming: row threshold for using streaming CSV exports
-# When row count >= this threshold, use streaming response instead of loading
-# all data into memory. Streaming provides real-time progress and handles
-# large datasets efficiently.
+# Row estimate at which chart CSV exports enter pre-execution export planning.
+# Direct database-to-response streaming is used only when the query requires no
+# DataFrame transformations and both the engine spec and runtime dialect expose
+# the required streaming contract. Other plans use the non-direct export path.
 CSV_STREAMING_ROW_THRESHOLD = 100000
 
 # Durable store used by CHART_DATA_ASYNC_EXPORTS. The object must implement

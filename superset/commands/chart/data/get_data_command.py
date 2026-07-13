@@ -62,6 +62,11 @@ class ChartDataCommand(BaseCommand):
     def __init__(self, query_context: QueryContext):
         self._query_context = query_context
 
+    @property
+    def query_context(self) -> QueryContext:
+        """Return the immutable execution input owned by this command."""
+        return self._query_context
+
     def run(self, **kwargs: Any) -> dict[str, Any]:
         """Execute and return the historical payload shape."""
         options = ChartDataExecutionOptions(
