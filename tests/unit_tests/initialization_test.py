@@ -39,6 +39,54 @@ def _unwrap_to_app_root(app):
 
 
 class TestSupersetApp:
+    @patch("superset.app.ScriptDirectory.from_config")
+    @patch("superset.app.MigrationContext.configure")
+    @patch("superset.extensions.db")
+    def test_database_readiness_accepts_all_alembic_heads(
+        self,
+        mock_db,
+        mock_migration_context,
+        mock_script_directory,
+    ):
+        """A branched migration graph is ready only when every head is applied."""
+        app = SupersetApp(__name__)
+        current_context = mock_migration_context.return_value
+        current_context.get_current_heads.return_value = (
+            "head-access",
+            "head-tasks",
+        )
+        mock_script_directory.return_value.get_heads.return_value = (
+            "head-tasks",
+            "head-access",
+        )
+
+        assert app._is_database_up_to_date() is True
+
+        mock_db.engine.connect.return_value.__enter__.assert_called_once()
+        current_context.get_current_heads.assert_called_once_with()
+        mock_script_directory.return_value.get_heads.assert_called_once_with()
+
+    @patch("superset.app.ScriptDirectory.from_config")
+    @patch("superset.app.MigrationContext.configure")
+    @patch("superset.extensions.db")
+    def test_database_readiness_rejects_a_missing_alembic_head(
+        self,
+        mock_db,
+        mock_migration_context,
+        mock_script_directory,
+    ):
+        """A single applied branch is not ready when the script has two heads."""
+        app = SupersetApp(__name__)
+        mock_migration_context.return_value.get_current_heads.return_value = (
+            "head-access",
+        )
+        mock_script_directory.return_value.get_heads.return_value = (
+            "head-access",
+            "head-tasks",
+        )
+
+        assert app._is_database_up_to_date() is False
+
     @patch("superset.app.logger")
     def test_sync_config_to_db_skips_when_no_tables(self, mock_logger):
         """Test that sync is skipped when database is not up-to-date."""

@@ -149,24 +149,27 @@ class SupersetApp(Flask):
             # Import here to avoid circular import issues
             from superset.extensions import db
 
-            # Get current revision from database
+            # Alembic may have more than one terminal branch. A schema is ready
+            # only when the database records every script head, not one arbitrary
+            # head from the graph.
             with db.engine.connect() as connection:
                 context = MigrationContext.configure(connection)
-                current_rev = context.get_current_revision()
+                current_revisions = set(context.get_current_heads())
 
-            # Get head revision from migration files
+            # Get every terminal revision from migration files. get_current_head()
+            # raises when the migration graph has multiple heads.
             alembic_cfg = Config()
             alembic_cfg.set_main_option("script_location", "superset:migrations")
             script = ScriptDirectory.from_config(alembic_cfg)
-            head_rev = script.get_current_head()
+            head_revisions = set(script.get_heads())
 
-            # Database is up-to-date if current revision matches head
-            is_current = current_rev == head_rev
+            # Database is up-to-date if it has exactly the declared head set.
+            is_current = current_revisions == head_revisions
             if not is_current:
                 logger.debug(
-                    "Pending migrations. Current: %s, Head: %s",
-                    current_rev,
-                    head_rev,
+                    "Pending migrations. Current heads: %s, script heads: %s",
+                    sorted(current_revisions),
+                    sorted(head_revisions),
                 )
             return is_current
         except Exception as e:
